@@ -30,6 +30,7 @@ func TestAppAllowAndDeny(t *testing.T) {
 	out := &bytes.Buffer{}
 	errOut := &bytes.Buffer{}
 	app := New("1.0.0", out, errOut, nil)
+	app.FW = &firewall.MockBackend{} // Use mock backend to avoid requiring root in CI
 
 	// Allow
 	code := app.Run(context.Background(), []string{"allow", "80,443/tcp", "--comment", "web"})
