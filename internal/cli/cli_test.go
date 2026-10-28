@@ -5,6 +5,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/9star-academy/secctl/internal/firewall"
 )
 
 func TestAppHelpAndVersion(t *testing.T) {
