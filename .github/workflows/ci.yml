@@ -15,10 +15,68 @@ jobs:
           go-version-file: go.mod
       - run: go test -race -coverprofile=coverage.out ./...
       - run: go vet ./...
-      - run: bash -n scripts/install.sh scripts/test-linux-integration.sh
+      - run: bash -n scripts/install.sh scripts/test-linux-integration.sh scripts/test-ssh-integration.sh
       - run: bash scripts/test-install.sh
       - name: Build release platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /tmp/secctl-${target%/*}-${target#*/} ./cmd/secctl
           done
+  ssh-integration:
+    name: SSH integration (${{ matrix.os }}, ${{ matrix.mode }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            mode: socket
+          - os: ubuntu-22.04
+            mode: service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare disposable VM SSH and UFW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server ufw iproute2 python3
+          sudo systemctl stop ssh.service ssh.socket || true
+          cat > /tmp/secctl-test-sshd_config <<'EOF'
+          Port 22
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          AuthorizedKeysFile .ssh/authorized_keys
+          UsePAM yes
+          EOF
+          sudo install -m 0644 /tmp/secctl-test-sshd_config /etc/ssh/sshd_config
+          sudo ssh-keygen -A
+          sudo systemctl daemon-reload
+          if [ '${{ matrix.mode }}' = socket ]; then
+            sudo systemctl enable --now ssh.socket
+          else
+            sudo systemctl disable --now ssh.socket
+          fi
+          sudo systemctl start ssh.service
+          sudo sed -i 's/^MANAGE_BUILTINS=.*/MANAGE_BUILTINS=no/' /etc/default/ufw
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
+          go build -o /tmp/secctl ./cmd/secctl
+      - name: Real SSH confirmation and independent rollback
+        run: sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash scripts/test-ssh-integration.sh
+      - name: Real UFW and Docker lifecycle
+        if: matrix.mode == 'socket'
+        run: |
+          sudo systemctl start docker
+          sudo docker pull nginx:alpine
+          sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash scripts/test-linux-integration.sh
+      - name: Service diagnostics
+        if: failure()
+        run: |
+          sudo systemctl status ssh.service ssh.socket docker --no-pager || true
+          sudo journalctl -u ssh.service -u ssh.socket --since '-15 min' --no-pager
+          sudo journalctl -u 'secctl-rollback-*' --since '-15 min' --no-pager

@@ -21,11 +21,16 @@ type RollbackGuard struct {
 }
 
 type rollbackState struct {
-	Config string      `json:"config"`
-	Mode   os.FileMode `json:"mode"`
+	Config string       `json:"config"`
+	Mode   os.FileMode  `json:"mode"`
+	Socket *socketState `json:"socket,omitempty"`
 }
 
 func StartRollback(ctx context.Context, config string, original []byte, mode os.FileMode, seconds int) (*RollbackGuard, error) {
+	return startRollback(ctx, config, original, mode, seconds, nil)
+}
+
+func startRollback(ctx context.Context, config string, original []byte, mode os.FileMode, seconds int, socket *socketState) (*RollbackGuard, error) {
 	if seconds < 1 {
 		return nil, fmt.Errorf("回滚超时必须大于 0")
 	}
@@ -79,7 +84,7 @@ func StartRollback(ctx context.Context, config string, original []byte, mode os.
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	data, err := json.Marshal(rollbackState{Config: config, Mode: mode.Perm()})
+	data, err := json.Marshal(rollbackState{Config: config, Mode: mode.Perm(), Socket: socket})
 	if err != nil {
 		return nil, err
 	}
@@ -189,8 +194,14 @@ func RunRollback(ctx context.Context, dir string) error {
 		if err := atomicConfig(state.Config, original, state.Mode); err != nil {
 			return fmt.Errorf("恢复 SSH 配置失败: %w", err)
 		}
-		if err := ReloadSSHD(ctx); err != nil {
-			return fmt.Errorf("原配置已恢复，但 SSH 重载失败: %w", err)
+		var reloadErr error
+		if state.Socket != nil {
+			reloadErr = applySSHSocket(ctx, state.Socket, 0)
+		} else {
+			reloadErr = ReloadSSHD(ctx)
+		}
+		if reloadErr != nil {
+			return fmt.Errorf("原配置已恢复，但 SSH 监听恢复失败: %w", reloadErr)
 		}
 		// Keep the pending marker until reload succeeds so systemd can retry a failure.
 		if err := os.Rename(pending, filepath.Join(dir, "restored")); err != nil {

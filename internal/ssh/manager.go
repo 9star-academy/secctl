@@ -64,6 +64,13 @@ func (m *Manager) Harden(ctx context.Context, opts HardenOptions) (*HardenResult
 	if err := validateSSHD(ctx, configPath, newConfig, opts); err != nil {
 		return nil, err
 	}
+	var socket *socketState
+	if opts.Port > 0 {
+		socket, err = captureSSHSocket(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if opts.DisableRootLogin && (opts.TargetUser == "root" || opts.TargetUser == "" && os.Geteuid() == 0) {
 		return nil, fmt.Errorf("禁止 root 登录时必须通过 --user 指定可登录的非 root 用户")
 	}
@@ -96,7 +103,7 @@ func (m *Manager) Harden(ctx context.Context, opts HardenOptions) (*HardenResult
 	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
 		return nil, err
 	}
-	guard, err := StartRollback(ctx, configPath, orig, info.Mode(), opts.TimeoutSeconds)
+	guard, err := startRollback(ctx, configPath, orig, info.Mode(), opts.TimeoutSeconds, socket)
 	if err != nil {
 		return nil, err
 	}
@@ -105,14 +112,14 @@ func (m *Manager) Harden(ctx context.Context, opts HardenOptions) (*HardenResult
 		if err := atomicConfig(configPath, []byte(newConfig), info.Mode()); err != nil {
 			return err
 		}
+		if socket != nil {
+			return applySSHSocket(ctx, socket, opts.Port)
+		}
 		if err := ReloadSSHD(ctx); err != nil {
 			return err
 		}
 		if opts.Port > 0 {
-			out, err := CommandRunner(ctx, "ss", "-H", "-ltnp", "sport = :"+strconv.Itoa(opts.Port))
-			if err != nil || !strings.Contains(string(out), "sshd") {
-				return fmt.Errorf("未确认 sshd 正在新端口监听（包括 socket 激活环境）: %s (%v)", out, err)
-			}
+			return verifySSHListener(ctx, strconv.Itoa(opts.Port), false)
 		}
 		return nil
 	})

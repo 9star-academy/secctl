@@ -24,6 +24,9 @@ func stubSSH(t *testing.T, failReload bool) *[]string {
 	calls := []string{}
 	CommandRunner = func(_ context.Context, name string, args ...string) ([]byte, error) {
 		calls = append(calls, name+" "+strings.Join(args, " "))
+		if name == "systemctl" && len(args) > 1 && args[0] == "show" && args[1] == "ssh.socket" {
+			return []byte("LoadState=not-found\nActiveState=inactive\n"), nil
+		}
 		if len(args) > 0 && args[0] == "-T" {
 			return []byte("port 22022\npubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no\npermitrootlogin without-password\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n"), nil
 		}

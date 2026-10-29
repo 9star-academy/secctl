@@ -81,7 +81,7 @@ exec 3<>"$TEST_DIR/input"
 SSH_PID=$!
 READY=0
 for _ in $(seq 1 80); do
-  if ss -H -ltnp 'sport = :22022' | grep -q sshd; then READY=1; break; fi
+  if grep -q '请新开终端验证 SSH 登录' "$TEST_DIR/ssh.log" && ss -H -ltnp 'sport = :22022' | grep -Eq 'sshd|systemd'; then READY=1; break; fi
   if ! kill -0 "$SSH_PID" 2>/dev/null; then cat "$TEST_DIR/ssh.log"; exit 1; fi
   sleep 0.1
 done
@@ -96,5 +96,6 @@ for _ in $(seq 1 50); do
 done
 if [ "$RESTORED" -ne 1 ]; then cat "$TEST_DIR/ssh.log"; echo "FAIL: 挂断后未自动恢复 SSH 配置"; exit 1; fi
 systemctl is-active --quiet ssh || systemctl is-active --quiet sshd
+if ss -H -ltn 'sport = :22022' | grep -q .; then echo 'FAIL: 回滚后新端口仍监听'; exit 1; fi
 echo "PASS: SSH SIGHUP 后独立定时器恢复原配置"
 echo "全部集成验收通过。整机 reboot 持久化仍需按文档单独验证。"
