@@ -1,103 +1,241 @@
-# secctl
+<div align="center">
 
-<p align="center">
-  <b>一行命令搞定 Linux 裸机安全加固与防火墙管理</b><br>
-  SSH 加固与独立回滚、端口规则管理、UFW 下的 Docker IPv4 bridge 访问控制。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/readme/logo-light.svg">
+  <img src="docs/assets/readme/logo-light.svg" alt="secctl" width="288" height="90">
+</picture>
+
+<p><strong>把 SSH、端口与 Docker 访问规则管清楚。</strong></p>
+
+<p>SSH 加固与回滚 · 防火墙规则管理 · Docker IPv4 bridge 防护</p>
+
+<p>
+  <a href="https://github.com/9star-academy/secctl/releases/tag/v1.0.2-rc.2"><img src="https://img.shields.io/badge/preview-v1.0.2--rc.2-0f766e?style=flat-square" alt="验收版本 v1.0.2-rc.2"></a>
+  <a href="https://github.com/9star-academy/secctl/actions/workflows/ci.yml"><img src="https://github.com/9star-academy/secctl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="go.mod"><img src="https://img.shields.io/badge/Go-1.24%2B-2563eb?style=flat-square" alt="Go 1.24+"></a>
+  <a href="#支持范围"><img src="https://img.shields.io/badge/Linux-amd64%20%7C%20arm64-475569?style=flat-square" alt="Linux amd64 / arm64"></a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/9star-academy/secctl/releases"><img src="https://img.shields.io/github/v/release/9star-academy/secctl?style=flat-square" alt="Release"></a>
-  <a href="https://github.com/9star-academy/secctl/blob/main/LICENSE"><img src="https://img.shields.io/github/license/9star-academy/secctl?style=flat-square" alt="License"></a>
+<p>
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#ssh-加固">SSH 加固</a> ·
+  <a href="#防火墙规则">防火墙规则</a> ·
+  <a href="#docker-防护">Docker 防护</a> ·
+  <a href="#验收与开发">验收与开发</a>
 </p>
+
+</div>
 
 ---
 
-## 为什么做 secctl？
+**secctl 是一个面向 Linux 服务器的安全管理命令行工具。** 查看谁在监听端口、调整访问规则、收紧 SSH 登录方式，并管理 Docker 发布端口的转发访问。
 
-新买一台云服务器，跑完 [`ShellReady`](https://github.com/9star-academy/ShellReady) 配好顺手的终端后，往往马上要面对三大安全痛点：
-1. **公网暴力扫描**：默认 22 端口每秒都在被肉鸡字典爆破，手改 `sshd_config` 稍有不慎就把自己锁在服务器外面。
-2. **Docker 端口裸奔陷阱**：很多开发者不知道 `docker run -p 5432:5432` 会直接修改 `iptables`，**完全绕过 `ufw` 防火墙**，导致数据库在不知情下对全网开放。
-3. **防火墙状态散乱**：搞不清机器上到底有哪些端口真正暴露在公网、是由哪个进程监听的。
+使用 Go 编写，无第三方 Go 依赖，单个二进制分发；服务器无需安装 Go。
 
-**`secctl` 提供了一套人类友好、带防失联保护的服务器安全加固 CLI。**
+## 能力概览
 
-## 当前功能与边界
+| 能力 | 用途 | 命令入口 |
+| --- | --- | --- |
+| 端口审计 | 监听端口、进程、PID 与基础风险提示 | `secctl audit` |
+| SSH 加固 | 导入公钥、修改端口、禁用密码，未确认自动回滚 | `secctl ssh harden` |
+| 端口规则 | 按端口、协议、来源设置放行或拒绝 | `secctl allow` / `deny` |
+| Docker 防护 | 将 Docker IPv4 bridge 流量接入 UFW 转发授权 | `secctl docker-shield` |
 
-- **SSH 加固**：GitHub / 本地公钥导入、修改端口、禁用密码登录。先用 `sshd -t/-T` 校验，再由 systemd 独立定时器提供回滚；默认 60 秒内输入 `confirm` 确认。终端退出不会取消定时器。原配置备份会保留。
-- **防火墙**：使用已启用的 UFW，或原生 iptables。缺少后端、UFW 未启用或命令执行失败时返回非零退出码。同一访问元组的旧 UFW 决策会先删除再插入首位，不同来源或接口规则会保留；`deny` 影响新连接，已有连接可能受系统连接跟踪规则放行。
-- **Docker Shield**：支持 Linux systemd、已启用 UFW（`MANAGE_BUILTINS=no`）、Docker iptables 后端的 IPv4 bridge 网络。使用独立 `SECCTL-DOCKER` 链；未显式放行的外部新连接被拒绝，保留已建立连接和容器出站流量。通过 UFW after.rules 和 Docker systemd drop-in 在重启时恢复。
-- **监听与配置审计**：列出监听端口、进程和基础风险提示，检查可读取的 SSH 实际配置及防火墙状态。非回环监听不代表公网一定可达，评分不替代外部连接验证。
+## 快速开始
 
-自动 IP 封禁、白名单管理、Docker 原生 nftables 后端和 IPv6 容器网络尚不支持。原生 iptables 后端仅管理 IPv4 内存规则，重启持久化由系统管理员配置；推荐使用 UFW。macOS 仅提供监听审计，防火墙状态显示为未知。
+> [!NOTE]
+> 本页使用已发布的 **v1.0.2-rc.2 验收版**。Ubuntu 26.04 的 `ssh.socket` 端口切换已纳入实机 CI；正式使用前，请按 [完整验收步骤](docs/acceptance-ubuntu-26.04.md) 验证自己的服务器。
 
-## 安装
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/9star-academy/secctl/main/scripts/install.sh | sudo bash
-```
-
-安装器校验发布包的 `SHA256SUMS`；没有校验文件的旧发布版本会拒绝安装。可通过 `SECCTL_VERSION=vX.Y.Z` 固定已发布版本。本地源码修复须发布新版本后才能通过安装器获取。
-
-本地构建：
+在测试服务器安装或升级：
 
 ```bash
-go build -o secctl ./cmd/secctl
-./secctl --help
+curl -fsSL https://raw.githubusercontent.com/9star-academy/secctl/v1.0.2-rc.2/scripts/install.sh \
+  | sudo env SECCTL_VERSION=v1.0.2-rc.2 bash
+
+secctl --version
 ```
 
-## 使用
+预期显示 `secctl version v1.0.2-rc.2`。安装器自动识别系统与 CPU 架构，校验 `SHA256SUMS`，安装到 `/usr/local/bin/secctl`。
 
-先保留当前 SSH 连接和云平台控制台入口，确认云安全组也允许目标端口。UFW 未启用时，请先手动保留当前 SSH 端口规则再启用，secctl 不会自动启用全局防火墙。
+先看看服务器当前的状态：
 
 ```bash
 sudo secctl audit
 sudo secctl status
+secctl --help
+```
 
-# --user 是目标系统账号；sudo 默认仍是 root，普通账号请显式指定。
-sudo secctl ssh harden --user ubuntu --github reedtang666 --port 22022 --disable-password
-# 或使用本地公钥
-sudo secctl ssh harden --user ubuntu --key ./id_ed25519.pub --disable-password
-# 立即另开终端确认能登录，然后在原终端输入 confirm。
+**审计展示的是监听与配置情况。** 某个端口监听在非回环地址上，不代表公网一定能访问；云安全组、路由和实际连接需要另外验证。
 
-# 宿主机端口：可带端口段、协议、来源和备注。
+<details>
+<summary>版本选择与安装说明</summary>
+
+- 预发布版本需要显式设置 `SECCTL_VERSION`；不指定版本时，安装器选择 GitHub 的最新正式 Release。
+- 安装器拒绝缺少校验文件或 SHA256 不匹配的发布包。
+- 安装依赖 `curl` 和 `sha256sum`，或 macOS 的 `shasum`。Linux 加固功能还需要相应系统工具，见 [支持范围](#支持范围)。
+- 源码推送到 `main` 不会更新已安装的二进制；需要安装对应的已发布版本。
+- 查看 [发布记录](https://github.com/9star-academy/secctl/releases) 和 [rc.2 变更说明](docs/releases/v1.0.2-rc.2.md)。
+
+</details>
+
+## SSH 加固
+
+修改 SSH 前，保留当前连接和云控制台入口，并确认云安全组允许目标端口。使用 UFW 时，先保留当前 SSH 端口的规则并启用 UFW；secctl 不会自动启用全局防火墙。
+
+下面以已有系统账号 `ubuntu`、目标端口 `22022` 为例。把用户名换成自己的登录账号，公钥文件放在服务器当前目录：
+
+```bash
+sudo secctl ssh harden \
+  --user ubuntu \
+  --key ./id_ed25519.pub \
+  --port 22022 \
+  --disable-password \
+  --timeout 180
+```
+
+也支持通过 `--github` 导入自己的 GitHub 公钥。先设置 `GITHUB_USER` 为你自己的账号，再执行：
+
+```bash
+GITHUB_USER='替换为你自己的GitHub用户名'
+sudo secctl ssh harden --user ubuntu --github "$GITHUB_USER" --disable-password
+```
+
+`--user` 指定要配置公钥的系统账号；使用 `sudo` 时默认目标仍是 `root`，普通账号请显式指定。这里只上传 `.pub` 公钥，私钥保留在你自己的电脑。
+
+**先验证，再确认：**
+
+1. 保持原终端打开，从另一个终端用对应私钥连接新端口。
+2. 确认能正常登录后，回到原终端输入 `confirm` 并回车。
+3. 未确认、超时、中断或会话挂断时，独立 systemd 定时器负责恢复原配置与相应监听。
+
+默认确认时间为 60 秒，上面的示例用 `--timeout 180` 留出验证时间。**确认完成前不要重启服务器**，临时回滚定时器不保证跨整机重启恢复。
+
+<details>
+<summary>配置兼容、备份与回滚细节</summary>
+
+- 修改前使用 `sshd -t` / `sshd -T` 检查配置及实际生效结果。
+- Ubuntu 26.04 的 `ssh.socket` 模式会刷新系统生成器并切换 socket 与服务，保留原启动方式。要求 `ssh.service` 使用 `KillMode=process`，以保留已有会话；固定 `ListenStream` 等自定义配置若未生成目标端口，会拒绝切换并恢复。
+- `Match` 条件块、带引号/转义/动态标记的 Include，以及 Include 中冲突的额外 Port 会停止自动加固，需要先手工核对。
+- 自定义 `AuthorizedKeysFile`、证书或动态公钥命令的认证环境，应手动加固。
+- 原配置备份保留在 `/etc/ssh/sshd_config.secctl.bak.*`；回滚状态位于 `/etc/ssh/sshd_config.secctl.pending/`。
+- 回滚失败会保留状态，并由 systemd 重试。可按命令输出的 `secctl-rollback-*.service` 名称查看日志，必要时从云控制台处理。
+- 已导入的公钥和新 SSH 端口放行规则会保留，不随 SSH 配置回滚自动撤销。
+- `--skip-confirm` 会立即确认配置，仅用于已经验证的自动化环境。
+
+</details>
+
+## 防火墙规则
+
+推荐使用**已启用的 UFW**。也支持原生 iptables，具体限制见 [支持范围](#支持范围)。
+
+```bash
+# 开放 Web 端口
 sudo secctl allow 80,443/tcp
-sudo secctl allow 8000-8010/tcp --from 10.0.0.0/8
+
+# 仅允许指定网段访问端口范围
+sudo secctl allow 8000-8010/tcp --from 10.0.0.0/8 --comment "内网服务"
+
+# 开放 UDP 端口
+sudo secctl allow 53/udp
+
+# 拒绝端口的新连接
 sudo secctl deny 8080/tcp
 
-# Docker Shield 开启后，使用独立的转发规则管理容器端口。
+# 查看状态与规则
+sudo secctl status
+```
+
+| 选项 | 用途 | 示例 |
+| --- | --- | --- |
+| `--from` | 限制来源 IP 或 CIDR 网段 | `--from 10.0.0.0/8` |
+| `--comment` | 给规则添加备注 | `--comment "内网数据库"` |
+| `--docker` | 管理 UFW 转发规则，填写容器端口 | `allow 5432/tcp --docker` |
+
+同一端口、协议和来源的旧 UFW 决策会更新，其他来源或接口范围的规则保留。`deny` 针对新连接；已建立的连接可能继续被系统连接跟踪规则放行。
+
+缺少真实防火墙后端、UFW 未激活或执行失败时，命令会返回非零退出码。
+
+## Docker 防护
+
+Docker 的发布端口会经过独立的转发规则。Docker Shield 使用 `SECCTL-DOCKER` 链，将支持范围内的流量交给 UFW 转发规则授权：**未获授权的外部新连接被拒绝**，保留已建立连接和容器出站流量。
+
+启用前需要：
+
+- Linux + systemd，已启用 UFW。
+- `/etc/default/ufw` 中设置 `MANAGE_BUILTINS=no`。
+- Docker 使用 iptables 后端，网络为默认 IPv4 bridge（`docker0` / `br-*`）。
+
+先运行 `sudo ufw status numbered` 检查已有转发规则；已有宽泛的转发 ALLOW 仍然属于授权。
+
+```bash
 sudo secctl docker-shield enable
 sudo secctl docker-shield status
-# 假设映射为 -p 15432:5432，这里填写容器端口 5432。
+```
+
+假设容器已经通过 `-p 15432:5432` 发布 PostgreSQL，规则里填写**容器端口 `5432`**：
+
+```bash
 sudo secctl allow 5432/tcp --docker --from 10.0.0.0/8 --comment "内网数据库"
 sudo secctl deny 5432/tcp --docker
+```
+
+规则通过 UFW 配置和 Docker systemd 启动挂接恢复，覆盖 UFW reload 与 Docker restart。整机重启后的外部访问结果请按 [验收文档](docs/acceptance-ubuntu-26.04.md) 实测。
+
+停用防护：
+
+```bash
 sudo secctl docker-shield disable
 ```
 
-SSH 自动加固会拒绝 `Match` 条件块（包括 Include 中的 Match），避免改变条件认证策略；带引号、转义或动态标记的 Include，以及 Include 中的额外 Port 也会停止，要求先手工整理。使用自定义 AuthorizedKeysFile、证书或动态公钥命令的环境，应手动加固。端口切换会核对实际监听；Ubuntu 26.04 的 `ssh.socket` 模式会刷新系统生成器并切换 socket 和服务，保留原启动方式。要求 `ssh.service` 使用 `KillMode=process` 以保留已有会话；自定义固定 ListenStream 等配置若未生成目标端口，会拒绝切换并恢复。独立回滚同时恢复配置与原 socket 监听。`--skip-confirm` 会立即确认配置，仅适用于已验证的自动化环境。
+停用后恢复 Docker 默认转发行为，容器发布端口可能重新对外可达。
 
-回滚状态位于 `/etc/ssh/sshd_config.secctl.pending/`，日志可通过输出的 `secctl-rollback-*.service` 查看。回滚失败会保留状态和原配置，并由 systemd 重试；应从云控制台检查。定时器是临时 systemd 单元，不能跨整机重启保证回滚；确认操作前不要重启服务器。SSH 端口的新增放行规则会保留，不自动删除已有规则。
+## 支持范围
 
-Docker Shield 当前针对默认 `docker0` 和 `br-*` 网桥；自定义网桥名称、host/macvlan/overlay、IPv6 容器及原生 nftables 不在保护范围。UFW 的转发 ALLOW 是授权来源；已有宽泛转发放行规则仍会放行，应先检查 `ufw status numbered`。禁用 Shield 会恢复 Docker 默认转发行为，容器发布端口可能重新对外可达。
+| 环境或能力 | 范围 |
+| --- | --- |
+| Linux 发布包 | amd64 / arm64；加固功能依赖系统已有工具 |
+| SSH 加固 | OpenSSH + systemd；支持普通服务和上述 Ubuntu socket 模式 |
+| UFW | 推荐后端；使用前需手动启用 |
+| 原生 iptables | 仅 IPv4 内存规则，重启持久化由系统管理员配置 |
+| Docker Shield | UFW + Docker iptables + 默认 IPv4 bridge |
+| macOS 发布包 | amd64 / arm64；仅提供监听审计，防火墙状态显示为未知 |
 
-## 验证
+自动 IP 封禁、独立白名单管理、Docker 原生 nftables 后端和 IPv6 容器尚未支持。自定义网桥名称、host / macvlan / overlay 不在 Docker Shield 保护范围。
+
+## 验收与开发
+
+**先在空白测试虚拟机验收，再用于实际服务器。**
+
+- [Ubuntu 26.04 完整验收](docs/acceptance-ubuntu-26.04.md)：安装、端口放行/拒绝、SSH 登录与回滚、Docker、整机重启、清理恢复。
+- [Linux 集成测试说明](docs/testing.md)：测试条件、脚本与验证边界。
+- [GitHub Actions](https://github.com/9star-academy/secctl/actions/workflows/ci.yml)：Ubuntu 26.04 socket、Ubuntu 22.04 普通服务模式，以及 UFW/Docker 生命周期检查。
+
+本地开发需要 Go 1.24+：
 
 ```bash
+go build -o secctl ./cmd/secctl
+./secctl --help
+
 go test -race -coverprofile=coverage.out ./...
 go vet ./...
-bash -n scripts/install.sh scripts/test-linux-integration.sh
+bash -n scripts/install.sh scripts/test-linux-integration.sh scripts/test-ssh-integration.sh
+bash scripts/test-install.sh
 ```
 
-真实连接、Docker 重启和 SSH 挂断回滚请在无业务的 Linux 虚拟机验证，参见 [Linux 集成验收](docs/testing.md)。单元测试以隔离的配置文件和命令替身运行，不修改开发机的 SSH、防火墙或 Docker。
+Go 单元测试使用隔离配置和命令替身，不修改开发机的 SSH、防火墙或 Docker。实机集成脚本会修改系统配置，只能在明确允许的空白测试虚拟机执行；实际网络和整机重启验收不能由单元测试替代。
 
-## 9star-academy 裸机轻量运维矩阵
+## 相关工具
 
-| 工具 | 定位 |
-| :--- | :--- |
-| [**ShellReady**](https://github.com/9star-academy/ShellReady) | 一条命令配好新 Linux 服务器（BBR、trzsz、Starship、Atuin、zoxide） |
-| [**secctl**](https://github.com/9star-academy/secctl) | 一行命令搞定裸机 SSH 加固、防火墙管理与 Docker 端口防泄漏 |
-| [**servctl**](https://github.com/9star-academy/servctl) | 一行命令将任意可执行程序托管为 `systemd` 系统自启服务 |
-| [**proxctl**](https://github.com/9star-academy/proxctl) | 一行命令搞定反向代理、静态站点托管与自动 HTTPS 证书 |
-| [**bakctl**](https://github.com/9star-academy/bakctl) | 一行命令将数据库与目录定时加密备份至 S3 / R2 / OSS / WebDAV |
+[9star-academy](https://github.com/9star-academy) 的轻量服务器工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| [ShellReady](https://github.com/9star-academy/ShellReady) | 服务器终端与常用环境初始化 |
+| **secctl** | SSH 加固、防火墙规则与 Docker 转发防护 |
+| [servctl](https://github.com/9star-academy/servctl) | 将可执行程序托管为 systemd 服务 |
+| [proxctl](https://github.com/9star-academy/proxctl) | 反向代理、静态站点与自动 HTTPS |
+| [bakctl](https://github.com/9star-academy/bakctl) | 目录、文件与数据库备份 |
 
 ## License
 

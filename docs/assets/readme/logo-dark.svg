@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="100" viewBox="0 0 320 100" role="img" aria-labelledby="title">
+  <title id="title">secctl</title>
+  <path d="M49 14 78 26v23c0 18-11 31-29 38C31 80 20 67 20 49V26Z" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linejoin="round"/>
+  <path d="m35 49 10 10 19-22" fill="none" stroke="#2dd4bf" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="103" y="74" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="70" font-weight="700" letter-spacing="-2">secctl</text>
+</svg>
