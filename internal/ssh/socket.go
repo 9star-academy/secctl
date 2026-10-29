@@ -38,16 +38,22 @@ func captureSSHSocket(ctx context.Context) (*socketState, error) {
 	if properties["LoadState"] != "loaded" || properties["ActiveState"] != "active" || properties["Accept"] != "no" || properties["Triggers"] != "ssh.service" {
 		return nil, fmt.Errorf("无法安全确认 ssh.socket 的监听模式，请先核对 systemctl status ssh.socket")
 	}
+	if _, err := parseSocketListeners(properties["Listen"]); err != nil {
+		return nil, err
+	}
+	// Snapshot the generator model, not the active fd representation. Ubuntu can
+	// display a dual-stack wildcard differently before and after daemon-reload.
+	// Refreshing the model here does not stop or replace the active listener.
+	listeners, err := regenerateSocketListeners(ctx)
+	if err != nil {
+		return nil, err
+	}
 	killMode, err := sshSystemctl(ctx, "show", "ssh.service", "--property=KillMode", "--value")
 	if err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(string(killMode)) != "process" {
 		return nil, fmt.Errorf("socket 端口切换要求 ssh.service KillMode=process，避免停止当前 SSH 会话；未修改 SSH 配置")
-	}
-	listeners, err := parseSocketListeners(properties["Listen"])
-	if err != nil {
-		return nil, err
 	}
 	return &socketState{Listeners: listeners}, nil
 }
@@ -78,18 +84,23 @@ func parseSocketListeners(value string) ([]string, error) {
 	return listeners, nil
 }
 
+// regenerateSocketListeners refreshes configuration without restarting listeners.
+func regenerateSocketListeners(ctx context.Context) ([]string, error) {
+	if _, err := sshSystemctl(ctx, "daemon-reload"); err != nil {
+		return nil, err
+	}
+	out, err := sshSystemctl(ctx, "show", "ssh.socket", "--property=Listen", "--value")
+	if err != nil {
+		return nil, err
+	}
+	return parseSocketListeners(string(out))
+}
+
 // applySSHSocket uses Ubuntu's generator rather than overriding administrator
 // units. A stale/custom ListenStream is rejected before stopping the old listener.
 // port == 0 restores the exact original generated listener set.
 func applySSHSocket(ctx context.Context, state *socketState, port int) error {
-	if _, err := sshSystemctl(ctx, "daemon-reload"); err != nil {
-		return err
-	}
-	out, err := sshSystemctl(ctx, "show", "ssh.socket", "--property=Listen", "--value")
-	if err != nil {
-		return err
-	}
-	listeners, err := parseSocketListeners(string(out))
+	listeners, err := regenerateSocketListeners(ctx)
 	if err != nil {
 		return err
 	}

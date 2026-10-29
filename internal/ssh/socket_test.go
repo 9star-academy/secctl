@@ -94,7 +94,7 @@ func TestSocketPortChangeConfirmsNewListener(t *testing.T) {
 	if f.listening != 22022 || strings.Contains(calls, "systemctl reload ssh") {
 		t.Fatalf("socket port did not switch: %d, %s", f.listening, calls)
 	}
-	if strings.Index(calls, "systemd-run ") > strings.Index(calls, "systemctl daemon-reload") {
+	if strings.Index(calls, "systemd-run ") > strings.Index(calls, "systemctl stop ssh.service ssh.socket") {
 		t.Fatal("listener changed before independent recovery was scheduled")
 	}
 	if _, err := os.Stat(config + ".secctl.pending"); !os.IsNotExist(err) {
@@ -226,5 +226,26 @@ func TestSocketTCPListenerParsing(t *testing.T) {
 	got, err := parseSocketListeners("[::]:22 (Stream) 127.0.0.1:22 (Stream)")
 	if err != nil || len(got) != 2 || got[0] != "127.0.0.1:22" {
 		t.Fatalf("valid IPv4/IPv6 listeners rejected: %v, %v", got, err)
+	}
+}
+
+func TestSocketRollbackSnapshotsRegeneratedConfiguration(t *testing.T) {
+	config := socketConfig(t)
+	f := mockSocket(t, config)
+	base := CommandRunner
+	CommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		// On Ubuntu the active socket can report one dual-stack fd, while the
+		// generator model contains separate IPv4 and IPv6 ListenStream entries.
+		if name == "systemctl" && len(args) > 4 && args[0] == "show" {
+			return []byte("LoadState=loaded\nActiveState=active\nAccept=no\nTriggers=ssh.service\nListen=[::]:22 (Stream)\n"), nil
+		}
+		return base(ctx, name, args...)
+	}
+	_, err := NewManager(&bytes.Buffer{}, strings.NewReader("")).Harden(context.Background(), HardenOptions{ConfigPath: config, Port: 22022, TimeoutSeconds: 60})
+	if err == nil || strings.Contains(err.Error(), "原监听地址未恢复") || f.listening != 22 {
+		t.Fatalf("active/model listener difference broke recovery: %v, port=%d", err, f.listening)
+	}
+	if _, err := os.Stat(filepath.Join(config+".secctl.pending", "pending")); !os.IsNotExist(err) {
+		t.Fatal("recovery retained pending state for equivalent generated listeners")
 	}
 }
