@@ -84,6 +84,9 @@ for port in 22022 22; do
   exec 3>&-
   test ! -e /etc/ssh/sshd_config.secctl.pending
   login "$port"
+  old_port=22
+  if [ "$port" -eq 22 ]; then old_port=22022; fi
+  if ss -H -ltn "sport = :$old_port" | grep -q .; then echo 'FAIL: 确认后旧端口仍监听'; exit 1; fi
   if [ "$SOCKET_MODE" -eq 1 ]; then systemctl is-active --quiet ssh.socket; fi
 done
 echo 'PASS: SSH 新端口公钥登录、confirm 保留配置、原会话存活、切回 22'

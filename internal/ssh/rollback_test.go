@@ -207,3 +207,32 @@ func TestConfirmFailureDisarmsRollback(t *testing.T) {
 		t.Fatal("confirmed configuration was rolled back")
 	}
 }
+
+func TestConfirmAcceptsAlreadyUnloadedRecoveryService(t *testing.T) {
+	stubSSH(t, false)
+	ctx := context.Background()
+	config := filepath.Join(t.TempDir(), "sshd_config")
+	if err := os.WriteFile(config, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := StartRollback(ctx, config, []byte("original"), 0600, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := CommandRunner
+	CommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "systemctl" && args[0] == "stop" && strings.Contains(strings.Join(args, " "), guard.Unit+".service") {
+			return []byte("Unit recovery.service not loaded"), errors.New("exit status 5")
+		}
+		if name == "systemctl" && args[0] == "show" && args[1] == guard.Unit+".service" {
+			return []byte("not-found\n"), nil
+		}
+		return base(ctx, name, args...)
+	}
+	if err := guard.Confirm(ctx); err != nil {
+		t.Fatalf("confirmed configuration falsely failed for unloaded transient service: %v", err)
+	}
+	if _, err := os.Stat(guard.Dir); !os.IsNotExist(err) {
+		t.Fatal("confirmed transaction state was not removed")
+	}
+}

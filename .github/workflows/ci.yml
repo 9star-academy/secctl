@@ -72,7 +72,7 @@ jobs:
           if ! sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash -x scripts/test-ssh-integration.sh 2>&1 | tee /tmp/secctl-ssh-integration.log; then
             python3 - <<'PY'
           from pathlib import Path
-          s = Path('/tmp/secctl-ssh-integration.log').read_text()[-55000:]
+          s = Path('/tmp/secctl-ssh-integration.log').read_text()[-3500:]
           print('::error title=SSH integration log::' + s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
           PY
             exit 1

@@ -58,8 +58,8 @@ func startRollback(ctx context.Context, config string, original []byte, mode os.
 	dir := config + ".secctl.pending"
 	if _, err := os.Stat(filepath.Join(dir, "pending")); os.IsNotExist(err) {
 		if unit, err := os.ReadFile(filepath.Join(dir, "unit")); err == nil {
-			if out, err := CommandRunner(ctx, "systemctl", "stop", string(unit)+".timer", string(unit)+".service"); err != nil {
-				return nil, fmt.Errorf("清理上次回滚定时器失败: %s (%w)", out, err)
+			if err := stopRollbackUnits(ctx, string(unit)); err != nil {
+				return nil, fmt.Errorf("清理上次回滚定时器失败: %w", err)
 			}
 			if err := os.RemoveAll(dir); err != nil {
 				return nil, err
@@ -151,11 +151,28 @@ func (g *RollbackGuard) Confirm(ctx context.Context) error {
 	if err := g.withLock(func() error { return os.Remove(filepath.Join(g.Dir, "pending")) }); err != nil {
 		return fmt.Errorf("无法确认（可能已回滚）: %w", err)
 	}
-	out, err := CommandRunner(ctx, "systemctl", "stop", g.Unit+".timer", g.Unit+".service")
-	if err != nil {
-		return fmt.Errorf("配置已确认，但停止定时器失败（回滚标记已撤销）: %s (%w)", out, err)
+	if err := stopRollbackUnits(ctx, g.Unit); err != nil {
+		return fmt.Errorf("配置已确认，但停止定时器失败（回滚标记已撤销）: %w", err)
 	}
 	return os.RemoveAll(g.Dir)
+}
+
+func stopRollbackUnits(ctx context.Context, unit string) error {
+	for _, suffix := range []string{".timer", ".service"} {
+		name := unit + suffix
+		out, err := CommandRunner(ctx, "systemctl", "stop", name)
+		if err == nil {
+			continue
+		}
+		// Stopping the timer may already garbage-collect its unused transient
+		// service. Confirm absence through systemd, without parsing localized errors.
+		state, stateErr := CommandRunner(ctx, "systemctl", "show", name, "--property=LoadState", "--value")
+		if stateErr == nil && strings.TrimSpace(string(state)) == "not-found" {
+			continue
+		}
+		return fmt.Errorf("停止 %s 失败: %s (%w)", name, out, errors.Join(err, stateErr))
+	}
+	return nil
 }
 
 func (g *RollbackGuard) release() {
