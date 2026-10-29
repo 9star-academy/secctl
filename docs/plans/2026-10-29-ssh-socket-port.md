@@ -37,7 +37,7 @@ The user explicitly requested fixing this compatibility issue and publishing a n
 - [x] Inspect current source, prior release and primary Ubuntu/systemd documentation.
 - [x] Select minimal design within the user's authorized fix and release scope.
 - [x] Observe failing regression tests, then implement.
-- [ ] Pass local verification and Ubuntu 26.04 live-service CI.
+- [x] Pass local verification and Ubuntu 26.04 live-service CI.
 - [ ] Publish and verify v1.0.2-rc.2.
 
 ## Verification before publication
@@ -47,3 +47,5 @@ The user explicitly requested fixing this compatibility issue and publishing a n
 - The first real-service runs exposed transient recovery service collection during confirmation and active/configured socket listener representation differences. Both have reproducing regression tests and fixes.
 - Ubuntu 22.04 service and Ubuntu 26.04 socket integration passed on source commit `1e3b098`.
 - Real UFW/Docker lifecycle passed on source commit `4ff6688` after fixing missing ufw-user-forward initialization. The combined test now waits for the recovery marker as well as restored file contents, so it cannot check the listener halfway through recovery.
+
+- Final complete CI passed on `bccee36`: Go/race/vet/build checks, Ubuntu 22.04 service SSH integration, Ubuntu 26.04 socket SSH integration, real UFW/Docker lifecycle and independent SSH recovery. Actual cloud-server external access and whole-VM reboot remain user acceptance steps.
