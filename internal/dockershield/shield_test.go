@@ -55,6 +55,13 @@ func TestShieldLifecycleAndFailureRestoresFile(t *testing.T) {
 					if failReload {
 						return nil, errors.New("reload failed")
 					}
+					persisted, err := os.ReadFile(rules)
+					if err != nil {
+						return nil, err
+					}
+					if strings.Contains(string(persisted), UFWRulesTagBegin) && !strings.Contains(string(persisted), ":ufw-user-forward - [0:0]") {
+						return nil, errors.New("iptables-restore: Chain 'ufw-user-forward' does not exist")
+					}
 					return nil, nil
 				case "docker network ls -q":
 					return []byte("bridge-id\n"), nil
@@ -72,6 +79,15 @@ func TestShieldLifecycleAndFailureRestoresFile(t *testing.T) {
 						return nil, errors.New("no chain")
 					}
 					return []byte(liveRules()), nil
+				}
+				if name == "iptables-restore" {
+					data, err := os.ReadFile(args[len(args)-1])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(string(data), ":ufw-user-forward") || strings.Contains(string(data), ":DOCKER-USER") {
+						t.Fatal("Docker restart must not flush UFW authorization or unrelated Docker rules")
+					}
 				}
 				if strings.HasPrefix(command, "iptables -I DOCKER-USER 1") {
 					live = true

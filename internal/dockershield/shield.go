@@ -53,6 +53,13 @@ func liveRules() string {
 
 func rulesBlock() string { return "*filter\n:SECCTL-DOCKER - [0:0]\n" + liveRules() + "COMMIT\n" }
 
+func ufwRulesBlock() string {
+	// UFW loads after.rules before user.rules has recreated its secondary chains.
+	// Declare the dependency only during UFW initialization; user.rules then loads
+	// its ACL. Runtime Docker restarts must never declare/flush this UFW-owned chain.
+	return strings.Replace(rulesBlock(), "*filter\n", "*filter\n:ufw-user-forward - [0:0]\n", 1)
+}
+
 func (s *ShieldManager) defaults() {
 	d := NewShieldManager()
 	if s.AfterRulesPath == "" {
@@ -297,7 +304,7 @@ func (s *ShieldManager) Enable(ctx context.Context) error {
 			failures = append(failures, err)
 			return errors.Join(append([]error{cause}, failures...)...)
 		}
-		newContent := stripped + "\n" + UFWRulesTagBegin + "\n" + rulesBlock() + UFWRulesTagEnd + "\n"
+		newContent := stripped + "\n" + UFWRulesTagBegin + "\n" + ufwRulesBlock() + UFWRulesTagEnd + "\n"
 		if err := os.WriteFile(s.AfterRulesPath, []byte(newContent), 0640); err != nil {
 			return rollback(err)
 		}
