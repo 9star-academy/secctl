@@ -36,6 +36,13 @@ The user explicitly requested fixing this compatibility issue and publishing a n
 
 - [x] Inspect current source, prior release and primary Ubuntu/systemd documentation.
 - [x] Select minimal design within the user's authorized fix and release scope.
-- [ ] Observe failing regression tests, then implement.
+- [x] Observe failing regression tests, then implement.
 - [ ] Pass local verification and Ubuntu 26.04 live-service CI.
 - [ ] Publish and verify v1.0.2-rc.2.
+
+## Verification before publication
+
+- Local race/coverage suite and vet passed; aggregate coverage 82.0%.
+- Linux/macOS amd64/arm64 builds and installer SHA256 tests passed.
+- The first real-service runs exposed transient recovery service collection during confirmation and active/configured socket listener representation differences. Both have reproducing regression tests and fixes.
+- Ubuntu 22.04 service and Ubuntu 26.04 socket integration passed on source commit `1e3b098`; the subsequent Docker lifecycle CI is being diagnosed before tagging.

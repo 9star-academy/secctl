@@ -82,7 +82,15 @@ jobs:
         run: |
           sudo systemctl start docker
           sudo docker pull nginx:alpine
-          sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash scripts/test-linux-integration.sh
+          set -o pipefail
+          if ! sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash scripts/test-linux-integration.sh 2>&1 | tee /tmp/secctl-linux-integration.log; then
+            python3 - <<'PY'
+          from pathlib import Path
+          s = Path('/tmp/secctl-linux-integration.log').read_text()[-3500:]
+          print('::error title=Linux integration log::' + s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PY
+            exit 1
+          fi
       - name: Service diagnostics
         if: failure()
         run: |
