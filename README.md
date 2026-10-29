@@ -73,7 +73,7 @@ sudo secctl deny 5432/tcp --docker
 sudo secctl docker-shield disable
 ```
 
-SSH 自动加固会拒绝 `Match` 条件块（包括 Include 中的 Match），避免改变条件认证策略；带引号、转义或动态标记的 Include，以及 Include 中的额外 Port 也会停止，要求先手工整理。使用自定义 AuthorizedKeysFile、证书或动态公钥命令的环境，应手动加固。端口切换会核对 `sshd` 的新监听端口；socket 激活环境若未切换监听，会恢复原配置并报错。`--skip-confirm` 会立即确认配置，仅适用于已验证的自动化环境。
+SSH 自动加固会拒绝 `Match` 条件块（包括 Include 中的 Match），避免改变条件认证策略；带引号、转义或动态标记的 Include，以及 Include 中的额外 Port 也会停止，要求先手工整理。使用自定义 AuthorizedKeysFile、证书或动态公钥命令的环境，应手动加固。端口切换会核对实际监听；Ubuntu 26.04 的 `ssh.socket` 模式会刷新系统生成器并切换 socket 和服务，保留原启动方式。要求 `ssh.service` 使用 `KillMode=process` 以保留已有会话；自定义固定 ListenStream 等配置若未生成目标端口，会拒绝切换并恢复。独立回滚同时恢复配置与原 socket 监听。`--skip-confirm` 会立即确认配置，仅适用于已验证的自动化环境。
 
 回滚状态位于 `/etc/ssh/sshd_config.secctl.pending/`，日志可通过输出的 `secctl-rollback-*.service` 查看。回滚失败会保留状态和原配置，并由 systemd 重试；应从云控制台检查。定时器是临时 systemd 单元，不能跨整机重启保证回滚；确认操作前不要重启服务器。SSH 端口的新增放行规则会保留，不自动删除已有规则。
 

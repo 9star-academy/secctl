@@ -67,7 +67,16 @@ jobs:
           sudo ufw --force enable
           go build -o /tmp/secctl ./cmd/secctl
       - name: Real SSH confirmation and independent rollback
-        run: sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash scripts/test-ssh-integration.sh
+        run: |
+          set -o pipefail
+          if ! sudo env SECCTL_TEST_DISPOSABLE_VM=1 SECCTL_BIN=/tmp/secctl bash -x scripts/test-ssh-integration.sh 2>&1 | tee /tmp/secctl-ssh-integration.log; then
+            python3 - <<'PY'
+          from pathlib import Path
+          s = Path('/tmp/secctl-ssh-integration.log').read_text()[-55000:]
+          print('::error title=SSH integration log::' + s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PY
+            exit 1
+          fi
       - name: Real UFW and Docker lifecycle
         if: matrix.mode == 'socket'
         run: |
