@@ -12,7 +12,7 @@ for tool in ssh sshd ssh-keygen systemctl ss ufw; do command -v "$tool" >/dev/nu
 ufw status | grep -q 'Status: active'
 if ss -H -ltn 'sport = :22022' | grep -q .; then echo '测试端口 22022 已占用'; exit 2; fi
 if [ -e /etc/ssh/sshd_config.secctl.pending/pending ]; then echo '已有待确认的 SSH 操作'; exit 2; fi
-sshd -T | grep -qx 'port 22'
+sshd -T | grep -x 'port 22' >/dev/null
 TEST_DIR=$(mktemp -d)
 cp -a /etc/ssh/sshd_config "$TEST_DIR/original"
 ROOT_HOME=$(getent passwd root | cut -d: -f6)
@@ -36,6 +36,7 @@ reload_original() {
   fi
 }
 cleanup() {
+  if [ -f "$TEST_DIR/ssh.log" ]; then cat "$TEST_DIR/ssh.log"; fi
   if [ -n "$SSH_PID" ]; then kill -INT "$SSH_PID" 2>/dev/null || true; wait "$SSH_PID" 2>/dev/null || true; fi
   ssh "${SSH_OPTIONS[@]}" -S "$TEST_DIR/control" -O exit -p 22 root@127.0.0.1 >/dev/null 2>&1 || true
   if [ -e /etc/ssh/sshd_config.secctl.pending/pending ]; then
@@ -78,7 +79,7 @@ for port in 22022 22; do
   # The connection accepted before restarting the listener must remain usable.
   ssh "${SSH_OPTIONS[@]}" -S "$TEST_DIR/control" -p 22 root@127.0.0.1 'printf EXISTING_SESSION_OK' | grep -qx EXISTING_SESSION_OK
   printf 'confirm\n' >&3
-  wait "$SSH_PID"
+  if ! wait "$SSH_PID"; then cat "$TEST_DIR/ssh.log"; exit 1; fi
   SSH_PID=''
   exec 3>&-
   test ! -e /etc/ssh/sshd_config.secctl.pending
