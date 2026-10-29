@@ -20,55 +20,86 @@ func (i *IptablesBackend) IsAvailable() bool {
 }
 
 func (i *IptablesBackend) Enable(ctx context.Context) error {
-	// Usually iptables is already kernel level, ensure default policy
-	return nil
+	return fmt.Errorf("请显式配置 iptables 默认策略；secctl 不会自动更改全局策略")
 }
 
 func (i *IptablesBackend) Allow(ctx context.Context, rule Rule) error {
-	args := []string{"-I", "INPUT", "-p", rule.Protocol, "--dport", rule.Port}
-	if rule.FromIP != "" && rule.FromIP != "Anywhere" {
-		args = append(args, "-s", rule.FromIP)
-	}
-	args = append(args, "-j", "ACCEPT")
-
-	out, err := CommandRunner(ctx, "iptables", args...)
-	if err != nil {
-		return fmt.Errorf("执行 iptables allow 失败: %s (%w)", string(out), err)
-	}
-	return nil
+	return i.apply(ctx, rule, "ACCEPT")
 }
 
 func (i *IptablesBackend) Deny(ctx context.Context, rule Rule) error {
-	args := []string{"-D", "INPUT", "-p", rule.Protocol, "--dport", rule.Port, "-j", "ACCEPT"}
-	out, err := CommandRunner(ctx, "iptables", args...)
-	if err != nil {
-		return fmt.Errorf("执行 iptables 删除规则失败: %s (%w)", string(out), err)
+	return i.apply(ctx, rule, "DROP")
+}
+
+func (i *IptablesBackend) apply(ctx context.Context, rule Rule, action string) error {
+	if err := ValidateRule(rule); err != nil {
+		return err
+	}
+	if rule.Routed {
+		return fmt.Errorf("--docker 转发规则仅支持 UFW 后端")
+	}
+	if strings.Contains(rule.FromIP, ":") {
+		return fmt.Errorf("iptables 后端仅管理 IPv4；IPv6 请使用 UFW")
+	}
+	protocols := []string{rule.Protocol}
+	if rule.Protocol == "any" {
+		protocols = []string{"tcp", "udp"}
+	}
+	for _, proto := range protocols {
+		args := []string{"-I", "INPUT", "-p", proto, "--dport", strings.ReplaceAll(rule.Port, "-", ":")}
+		if rule.FromIP != "" {
+			args = append(args, "-s", rule.FromIP)
+		}
+		args = append(args, "-j", action)
+		if rule.Comment != "" {
+			args = append(args, "-m", "comment", "--comment", rule.Comment)
+		}
+		if out, err := CommandRunner(ctx, "iptables", args...); err != nil {
+			return fmt.Errorf("执行 iptables %s 失败（可能已部分应用）: %s (%w)", action, out, err)
+		}
 	}
 	return nil
 }
 
 func (i *IptablesBackend) Status(ctx context.Context) ([]Rule, bool, error) {
-	out, err := CommandRunner(ctx, "iptables", "-L", "INPUT", "-n", "--line-numbers")
+	out, err := CommandRunner(ctx, "iptables", "-S", "INPUT")
 	if err != nil {
 		return nil, false, err
 	}
 
 	var rules []Rule
+	active := false
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "num") || strings.HasPrefix(line, "Chain") || line == "" {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) >= 5 {
-			rules = append(rules, Rule{
-				Port:     "rule",
-				Action:   fields[1],
-				Protocol: fields[2],
-				FromIP:   fields[4],
-			})
+		if fields[0] == "-P" {
+			active = fields[2] == "DROP"
+			continue
 		}
+		if fields[0] != "-A" {
+			continue
+		}
+		rule := Rule{Number: len(rules) + 1, Port: "all", Protocol: "any", FromIP: "Anywhere"}
+		for j := 2; j+1 < len(fields); j++ {
+			switch fields[j] {
+			case "-p":
+				rule.Protocol = fields[j+1]
+			case "-s":
+				rule.FromIP = fields[j+1]
+			case "--dport":
+				rule.Port = fields[j+1]
+			case "-j":
+				rule.Action = fields[j+1]
+			}
+		}
+		if rule.Action == "DROP" || rule.Action == "REJECT" {
+			active = true
+		}
+		rules = append(rules, rule)
 	}
-	return rules, true, nil
+	return rules, active, scanner.Err()
 }

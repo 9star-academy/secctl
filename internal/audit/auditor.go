@@ -40,6 +40,8 @@ type SSHSummary struct {
 type AuditReport struct {
 	Ports               []PortItem `json:"ports"`
 	FirewallActive      bool       `json:"firewall_active"`
+	FirewallError       string     `json:"firewall_error,omitempty"`
+	DockerShieldError   string     `json:"docker_shield_error,omitempty"`
 	FirewallType        string     `json:"firewall_type"` // "ufw", "iptables", "none", "macos-pf"
 	SSH                 SSHSummary `json:"ssh"`
 	DockerInstalled     bool       `json:"docker_installed"`
@@ -59,22 +61,22 @@ func AssessRisk(port int, isPublic bool, process string) (RiskLevel, string) {
 	// High-risk database / cache ports exposed to public!
 	switch port {
 	case 3306, 33060:
-		return RiskDanger, "MySQL 暴露公网！极易遭到字典爆破与勒索"
+		return RiskDanger, "MySQL 非回环监听！极易遭到字典爆破与勒索"
 	case 5432:
-		return RiskDanger, "PostgreSQL 暴露公网！建议限制内网或关闭公网监听"
+		return RiskDanger, "PostgreSQL 非回环监听！建议限制内网或关闭公网监听"
 	case 6379:
-		return RiskDanger, "Redis 暴露公网！若无密码或弱密码存在严重提权风险"
+		return RiskDanger, "Redis 非回环监听！若无密码或弱密码存在严重提权风险"
 	case 27017:
-		return RiskDanger, "MongoDB 暴露公网！存在未授权访问勒索风险"
+		return RiskDanger, "MongoDB 非回环监听！存在未授权访问勒索风险"
 	case 9200, 9300:
-		return RiskDanger, "Elasticsearch 暴露公网！"
+		return RiskDanger, "Elasticsearch 非回环监听！"
 	case 2375, 2376:
-		return RiskDanger, "Docker Remote API 暴露公网！存在直接 root 逃逸提权风险"
+		return RiskDanger, "Docker Remote API 非回环监听！存在直接 root 逃逸提权风险"
 	}
 
 	if strings.Contains(pLower, "redis") || strings.Contains(pLower, "postgres") ||
 		strings.Contains(pLower, "mysql") || strings.Contains(pLower, "mongo") {
-		return RiskDanger, "数据库/缓存服务监听公网！"
+		return RiskDanger, "数据库/缓存服务非回环监听！"
 	}
 
 	// Web ports (normal)
@@ -92,7 +94,7 @@ func AssessRisk(port int, isPublic bool, process string) (RiskLevel, string) {
 		return RiskWarn, "Docker 容器映射端口暴露公网，注意确认是否已受防火墙保护"
 	}
 
-	return RiskWarn, fmt.Sprintf("公网开放端口 (%s)", process)
+	return RiskWarn, fmt.Sprintf("非回环监听 (%s)，实际可达性待核对", process)
 }
 
 // Auditor gathers system security data.

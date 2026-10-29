@@ -3,6 +3,8 @@ package firewall
 import (
 	"context"
 	"fmt"
+	"net/netip"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,6 +18,9 @@ type Rule struct {
 	FromIP   string `json:"from_ip,omitempty"`
 	Action   string `json:"action"` // "ALLOW", "DENY"
 	Comment  string `json:"comment,omitempty"`
+	Routed   bool   `json:"routed,omitempty"` // UFW forwarding rules for container traffic.
+	scoped   bool   // Interface/destination-specific rules are not replaced by generic decisions.
+	ipv6     bool
 }
 
 // Firewall manages system firewall rules.
@@ -63,9 +68,7 @@ func ParsePortProto(arg string) (port string, proto string, err error) {
 func validatePortSpec(spec string) error {
 	if strings.Contains(spec, "-") || strings.Contains(spec, ":") {
 		// Port range like 8000-8080 or 8000:8080
-		rangeParts := strings.FieldsFunc(spec, func(r rune) bool {
-			return r == '-' || r == ':'
-		})
+		rangeParts := strings.Split(strings.ReplaceAll(spec, "-", ":"), ":")
 		if len(rangeParts) != 2 {
 			return fmt.Errorf("非法端口段范围: %s", spec)
 		}
@@ -94,15 +97,45 @@ func DetectFirewall() Firewall {
 	if ipt.IsAvailable() {
 		return ipt
 	}
-	return &MockBackend{}
+	return &UnavailableBackend{}
 }
+
+// ValidateRule validates values crossing the system-command boundary.
+func ValidateRule(rule Rule) error {
+	if _, _, err := ParsePortProto(rule.Port + "/" + rule.Protocol); err != nil {
+		return err
+	}
+	if rule.FromIP != "" {
+		if _, err := netip.ParseAddr(rule.FromIP); err != nil {
+			if _, err := netip.ParsePrefix(rule.FromIP); err != nil {
+				return fmt.Errorf("非法来源 IP/CIDR: %s", rule.FromIP)
+			}
+		}
+	}
+	return nil
+}
+
+type UnavailableBackend struct{}
+
+func (*UnavailableBackend) Name() string      { return "unavailable" }
+func (*UnavailableBackend) IsAvailable() bool { return false }
+func (*UnavailableBackend) Status(context.Context) ([]Rule, bool, error) {
+	return nil, false, fmt.Errorf("未找到 UFW/iptables，无法管理或确认防火墙")
+}
+func (*UnavailableBackend) Allow(context.Context, Rule) error {
+	return fmt.Errorf("未找到 UFW/iptables，端口未放行")
+}
+func (*UnavailableBackend) Deny(context.Context, Rule) error {
+	return fmt.Errorf("未找到 UFW/iptables，端口未封禁")
+}
+func (*UnavailableBackend) Enable(context.Context) error { return fmt.Errorf("未找到 UFW/iptables") }
 
 // MockBackend fallback for testing or non-Linux systems
 type MockBackend struct {
 	Rules []Rule
 }
 
-func (m *MockBackend) Name() string     { return "mock" }
+func (m *MockBackend) Name() string      { return "mock" }
 func (m *MockBackend) IsAvailable() bool { return true }
 func (m *MockBackend) Status(ctx context.Context) ([]Rule, bool, error) {
 	return m.Rules, true, nil
@@ -122,5 +155,6 @@ func (m *MockBackend) Enable(ctx context.Context) error { return nil }
 // CommandRunner executes shell commands
 var CommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	return cmd.CombinedOutput()
 }

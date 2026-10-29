@@ -22,7 +22,11 @@ jobs:
           go-version: 'stable'
 
       - name: Run Tests
-        run: go test -v ./...
+        run: |
+          go test -race ./...
+          go vet ./...
+          bash -n scripts/install.sh
+          bash scripts/test-install.sh
 
       - name: Build Matrix Binaries
         run: |
@@ -35,10 +39,24 @@ jobs:
           CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/secctl-darwin-amd64 ./cmd/secctl
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/secctl-darwin-arm64 ./cmd/secctl
 
+      - name: Generate checksums
+        run: |
+          (cd dist && sha256sum secctl-* > SHA256SUMS)
+          if [ -f "docs/releases/${GITHUB_REF_NAME}.md" ]; then
+            cp "docs/releases/${GITHUB_REF_NAME}.md" dist/RELEASE_NOTES.md
+          else
+            printf 'secctl %s\n' "$GITHUB_REF_NAME" > dist/RELEASE_NOTES.md
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          body_path: dist/RELEASE_NOTES.md
+          fail_on_unmatched_files: true
           files: |
+            dist/SHA256SUMS
             dist/secctl-linux-amd64
             dist/secctl-linux-arm64
             dist/secctl-darwin-amd64

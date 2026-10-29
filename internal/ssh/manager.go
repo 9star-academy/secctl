@@ -3,18 +3,23 @@ package ssh
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// Manager orchestrates SSH hardening with anti-lockout protections.
 type Manager struct {
 	Out io.Writer
 	In  io.Reader
+	// Test seams keep privileged service operations out of unit tests.
+	ValidateKeys func(string) error
 }
 
 func NewManager(out io.Writer, in io.Reader) *Manager {
@@ -24,126 +29,275 @@ func NewManager(out io.Writer, in io.Reader) *Manager {
 	if in == nil {
 		in = os.Stdin
 	}
-	return &Manager{Out: out, In: in}
+	return &Manager{Out: out, In: in, ValidateKeys: checkLoginKeys}
 }
 
-// Harden performs the full hardening workflow with anti-lockout countdown.
 func (m *Manager) Harden(ctx context.Context, opts HardenOptions) (*HardenResult, error) {
+	if opts.Port < 0 || opts.Port > 65535 {
+		return nil, fmt.Errorf("SSH 端口必须在 1-65535 之间")
+	}
+	if opts.TimeoutSeconds <= 0 || opts.TimeoutSeconds > 3600 {
+		return nil, fmt.Errorf("回滚超时必须在 1-3600 秒之间")
+	}
 	configPath := opts.ConfigPath
 	if configPath == "" {
 		configPath = "/etc/ssh/sshd_config"
 	}
-
-	result := &HardenResult{
-		PortChangedTo: opts.Port,
-		PasswordAuth:  !opts.DisablePassword,
+	if err := rejectMatchIncludes(configPath, map[string]bool{}); err != nil {
+		return nil, err
 	}
-
-	// 1. Pull GitHub keys if requested
-	if opts.GitHubUser != "" {
-		fmt.Fprintf(m.Out, "==> 正在从 GitHub (https://github.com/%s.keys) 拉取公钥...\n", opts.GitHubUser)
-		keys, err := FetchGitHubKeys(ctx, opts.GitHubUser)
-		if err != nil {
-			return nil, fmt.Errorf("拉取 GitHub 公钥失败: %w", err)
-		}
-		fmt.Fprintf(m.Out, "✔ 成功获取 %d 条公钥，正在注入 authorized_keys...\n", len(keys))
-
-		added, err := InstallAuthorizedKeys(opts.TargetUser, keys)
-		if err != nil {
-			return nil, fmt.Errorf("注入 authorized_keys 失败: %w", err)
-		}
-		result.KeysAdded = added
-		fmt.Fprintf(m.Out, "✔ 已成功添加 %d 条新公钥（跳过已存在的重复公钥）\n", added)
-	}
-
-	// 2. Read original sshd_config
-	origBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("无法读取 SSH 配置文件 %s: %w", configPath, err)
-	}
-
-	// 3. Backup original config
-	backupPath := fmt.Sprintf("%s.secctl.bak.%d", configPath, time.Now().Unix())
-	if err := os.WriteFile(backupPath, origBytes, 0600); err != nil {
-		return nil, fmt.Errorf("创建备份文件失败: %w", err)
-	}
-	result.BackupPath = backupPath
-	fmt.Fprintf(m.Out, "✔ 已创建配置安全备份: %s\n", backupPath)
-
-	// 4. Update config in memory
-	newConfig, err := UpdateSSHDConfig(string(origBytes), opts)
+	info, err := os.Lstat(configPath)
 	if err != nil {
 		return nil, err
 	}
-
-	// 5. Test test-syntax with temporary file if sshd binary is available
-	tmpConfig := filepath.Join(os.TempDir(), fmt.Sprintf("sshd_config_test_%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpConfig, []byte(newConfig), 0600); err == nil {
-		defer os.Remove(tmpConfig)
-		if sshdBin, err := exec.LookPath("sshd"); err == nil {
-			cmd := exec.CommandContext(ctx, sshdBin, "-t", "-f", tmpConfig)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return nil, fmt.Errorf("新 SSH 配置语法校验未通过，已中止写入以防失联: %s", string(out))
-			}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("SSH 配置必须是普通文件: %s", configPath)
+	}
+	orig, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	newConfig, err := UpdateSSHDConfig(string(orig), opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSSHD(ctx, configPath, newConfig, opts); err != nil {
+		return nil, err
+	}
+	if opts.DisableRootLogin && (opts.TargetUser == "root" || opts.TargetUser == "" && os.Geteuid() == 0) {
+		return nil, fmt.Errorf("禁止 root 登录时必须通过 --user 指定可登录的非 root 用户")
+	}
+	keys := append([]string{}, opts.ManualKeys...)
+	if opts.GitHubUser != "" {
+		fetched, err := FetchGitHubKeys(ctx, opts.GitHubUser)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, fetched...)
+	}
+	added, err := InstallAuthorizedKeys(opts.TargetUser, keys)
+	if err != nil {
+		return nil, err
+	}
+	if opts.DisablePassword || opts.PermitRootKeysOnly {
+		if err := m.ValidateKeys(opts.TargetUser); err != nil {
+			return nil, err
 		}
 	}
-
-	// 6. Write new config to target path
-	if err := os.WriteFile(configPath, []byte(newConfig), 0600); err != nil {
-		return nil, fmt.Errorf("写入新配置文件失败: %w", err)
+	// A unique backup is retained even after confirmation or automatic recovery.
+	backup, err := os.CreateTemp(filepath.Dir(configPath), "sshd_config.secctl.bak.*")
+	if err != nil {
+		return nil, err
 	}
-
-	// 7. Reload SSH service
-	fmt.Fprintf(m.Out, "==> 正在安全重载 SSH 服务...\n")
-	if err := ReloadSSHD(ctx); err != nil {
-		fmt.Fprintf(m.Out, "⚠️ 重载 SSH 出现告警: %v\n", err)
-	} else {
-		fmt.Fprintf(m.Out, "✔ SSH 服务已重载生效\n")
+	backupPath := backup.Name()
+	_, writeErr := backup.Write(orig)
+	syncErr := backup.Sync()
+	closeErr := backup.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return nil, err
 	}
-
-	// 8. If skip rollback requested, return immediately
-	if opts.SkipRollbackConfirm || opts.TimeoutSeconds <= 0 {
+	guard, err := StartRollback(ctx, configPath, orig, info.Mode(), opts.TimeoutSeconds)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(m.Out, "✔ 已备份: %s\n✔ 独立回滚定时器: %s.timer\n", backupPath, guard.Unit)
+	err = guard.Apply(func() error {
+		if err := atomicConfig(configPath, []byte(newConfig), info.Mode()); err != nil {
+			return err
+		}
+		if err := ReloadSSHD(ctx); err != nil {
+			return err
+		}
+		if opts.Port > 0 {
+			out, err := CommandRunner(ctx, "ss", "-H", "-ltnp", "sport = :"+strconv.Itoa(opts.Port))
+			if err != nil || !strings.Contains(string(out), "sshd") {
+				return fmt.Errorf("未确认 sshd 正在新端口监听（包括 socket 激活环境）: %s (%v)", out, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		rollbackErr := guard.Rollback(rollbackCtx)
+		return nil, errors.Join(fmt.Errorf("应用 SSH 配置失败: %w", err), rollbackErr)
+	}
+	result := &HardenResult{BackupPath: backupPath, KeysAdded: added, PortChangedTo: opts.Port, PasswordAuth: !opts.DisablePassword}
+	if opts.SkipRollbackConfirm {
+		if err := guard.Confirm(ctx); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
-
-	// 9. Anti-lockout countdown validation
-	timeoutSec := opts.TimeoutSeconds
-	if timeoutSec <= 0 {
-		timeoutSec = 60
-	}
-
-	fmt.Fprintln(m.Out, "\n==================================================================")
-	fmt.Fprintf(m.Out, "🛡️ 【防失联安全确认模式生效中】\n")
-	if opts.Port > 0 {
-		fmt.Fprintf(m.Out, "请立即新开一个终端窗口测试连接:\n  ssh -p %d <user>@<this-server-ip>\n", opts.Port)
-	} else {
-		fmt.Fprintf(m.Out, "请新开终端窗口测试登录确认无误。\n")
-	}
-	fmt.Fprintf(m.Out, "若连接成功，请在 %d 秒内在此按下 [Enter] 确认；\n若超时或按 Ctrl+C，secctl 将自动回滚恢复原配置，绝不锁死服务器！\n", timeoutSec)
-	fmt.Fprintln(m.Out, "==================================================================")
-
+	fmt.Fprintf(m.Out, "请新开终端验证 SSH 登录；成功后在 %d 秒内输入 confirm。\n超时、中断或会话退出后，由独立定时器恢复原配置。\n", opts.TimeoutSeconds)
 	confirmed := make(chan bool, 1)
 	go func() {
 		scanner := bufio.NewScanner(m.In)
 		if scanner.Scan() {
-			confirmed <- true
+			confirmed <- strings.TrimSpace(scanner.Text()) == "confirm"
+		} else {
+			confirmed <- false
 		}
 	}()
-
+	timer := time.NewTimer(time.Duration(opts.TimeoutSeconds) * time.Second)
+	defer timer.Stop()
+	var reason error
 	select {
-	case <-confirmed:
-		fmt.Fprintf(m.Out, "\n🎉 确认成功！新配置已正式锁定。\n备份文件已保留在: %s\n", backupPath)
-		return result, nil
-	case <-time.After(time.Duration(timeoutSec) * time.Second):
-		fmt.Fprintf(m.Out, "\n⏰ 超过 %d 秒未收到确认，正在执行自动回滚以防失联...\n", timeoutSec)
-		_ = os.WriteFile(configPath, origBytes, 0600)
-		_ = ReloadSSHD(context.Background())
-		fmt.Fprintf(m.Out, "✔ 已成功回滚至原配置并重启 SSH 服务，服务器连接已恢复。\n")
-		return nil, fmt.Errorf("操作超时未确认，已自动回滚以防失联")
+	case ok := <-confirmed:
+		if ok {
+			if err := guard.Confirm(ctx); err != nil {
+				return nil, err
+			}
+			fmt.Fprintln(m.Out, "✔ 新 SSH 配置已确认")
+			return result, nil
+		}
+		reason = fmt.Errorf("未收到 confirm，恢复原配置")
+	case <-timer.C:
+		reason = fmt.Errorf("确认超时，恢复原配置")
 	case <-ctx.Done():
-		fmt.Fprintf(m.Out, "\n接收到中断信号，正在回滚...\n")
-		_ = os.WriteFile(configPath, origBytes, 0600)
-		_ = ReloadSSHD(context.Background())
-		return nil, ctx.Err()
+		reason = ctx.Err()
 	}
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := guard.Rollback(rollbackCtx); err != nil {
+		return nil, errors.Join(reason, err)
+	}
+	fmt.Fprintln(m.Out, "✔ 已恢复原 SSH 配置并成功重载服务")
+	return nil, reason
+}
+
+func validateSSHD(ctx context.Context, configPath, config string, opts HardenOptions) error {
+	binary, err := exec.LookPath("sshd")
+	if err != nil {
+		return fmt.Errorf("未找到 sshd，无法验证配置: %w", err)
+	}
+	f, err := os.CreateTemp(filepath.Dir(configPath), ".secctl-sshd-test-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(config); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	for _, flag := range []string{"-t", "-T"} {
+		out, err := CommandRunner(ctx, binary, flag, "-f", f.Name())
+		if err != nil {
+			return fmt.Errorf("sshd %s 校验失败，未写入配置: %s (%w)", flag, out, err)
+		}
+		if flag == "-T" {
+			values := map[string][]string{}
+			for _, line := range strings.Split(string(out), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					values[fields[0]] = append(values[fields[0]], fields[1])
+				}
+			}
+			if opts.DisablePassword || opts.PermitRootKeysOnly {
+				if len(values["authorizedkeysfile"]) == 0 || values["authorizedkeysfile"][0] != ".ssh/authorized_keys" {
+					return fmt.Errorf("仅支持默认 AuthorizedKeysFile .ssh/authorized_keys，请手工核对自定义认证路径")
+				}
+			}
+			wanted := map[string]string{"pubkeyauthentication": "yes"}
+			if opts.DisablePassword {
+				wanted["passwordauthentication"] = "no"
+				wanted["kbdinteractiveauthentication"] = "no"
+			}
+			if opts.DisableRootLogin {
+				wanted["permitrootlogin"] = "no"
+			} else if opts.PermitRootKeysOnly {
+				wanted["permitrootlogin"] = "without-password"
+			}
+			for key, want := range wanted {
+				got := values[key]
+				if key == "permitrootlogin" && want == "without-password" && len(got) == 1 && got[0] == "prohibit-password" {
+					continue
+				}
+				if len(got) != 1 || got[0] != want {
+					return fmt.Errorf("实际 SSH 配置 %s=%v，预期 %s；未修改配置", key, got, want)
+				}
+			}
+			if opts.Port > 0 && (len(values["port"]) != 1 || values["port"][0] != strconv.Itoa(opts.Port)) {
+				return fmt.Errorf("Include 中的 Port 与目标端口冲突: %v；请先手动整理端口配置", values["port"])
+			}
+		}
+	}
+	return nil
+}
+
+func rejectMatchIncludes(path string, seen map[string]bool) error {
+	if seen[path] {
+		return nil
+	}
+	seen[path] = true
+	if len(seen) > 128 {
+		return fmt.Errorf("SSH Include 文件过多")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if strings.EqualFold(fields[0], "Match") {
+			return fmt.Errorf("%s 包含 Match 条件块，自动加固已停止；请手动核对条件策略", path)
+		}
+		if strings.EqualFold(fields[0], "Include") {
+			if strings.ContainsAny(line, "\"'\\%") {
+				return fmt.Errorf("%s 包含带引号、转义或动态标记的 Include，自动加固已停止；请手动整理配置", path)
+			}
+			for _, pattern := range fields[1:] {
+				if strings.HasPrefix(pattern, "#") {
+					break
+				}
+				pattern = strings.Trim(pattern, "\"")
+				if !filepath.IsAbs(pattern) {
+					pattern = filepath.Join("/etc/ssh", pattern)
+				}
+				paths, err := filepath.Glob(pattern)
+				if err != nil {
+					return err
+				}
+				for _, include := range paths {
+					if err := rejectMatchIncludes(include, seen); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func checkLoginKeys(target string) error {
+	var account *user.User
+	var err error
+	if target == "" || target == "current" {
+		account, err = user.Current()
+	} else {
+		account, err = user.Lookup(target)
+	}
+	if err != nil {
+		return err
+	}
+	return checkKeysFile(filepath.Join(account.HomeDir, ".ssh", "authorized_keys"))
+}
+
+func checkKeysFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("目标用户没有可读取的 authorized_keys，未禁用密码: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if isValidSSHKey(strings.TrimSpace(line)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("目标用户没有有效公钥；请先用 --github 或 --key 配置并验证密钥登录")
 }

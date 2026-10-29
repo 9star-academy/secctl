@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -18,12 +19,16 @@ func NewAuditor() *SystemAuditor {
 }
 
 func (a *SystemAuditor) Audit(ctx context.Context) (*AuditReport, error) {
-	ports, _ := a.scanPorts(ctx)
+	ports, err := a.scanPorts(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	report := &AuditReport{
 		Ports:               ports,
-		FirewallActive:      true,
-		FirewallType:        "macos-pf",
+		FirewallError:       "macOS 防火墙状态未检测；安全加固功能仅支持 Linux",
+		FirewallActive:      false,
+		FirewallType:        "unknown",
 		DockerInstalled:     false,
 		DockerShieldEnabled: false,
 		SSH: SSHSummary{
@@ -98,13 +103,12 @@ func (a *SystemAuditor) scanPorts(ctx context.Context) ([]PortItem, error) {
 }
 
 func isPublicAddr(addr string) bool {
-	if addr == "*" || addr == "0.0.0.0" || addr == "::" || addr == "" {
-		return true
+	addr = strings.Trim(addr, "[]")
+	if i := strings.Index(addr, "%"); i >= 0 {
+		addr = addr[:i]
 	}
-	if addr == "127.0.0.1" || addr == "localhost" || addr == "::1" || strings.HasPrefix(addr, "127.") {
-		return false
-	}
-	return true
+	ip := net.ParseIP(addr)
+	return addr != "localhost" && (ip == nil || !ip.IsLoopback())
 }
 
 func (r *AuditReport) Evaluate() {
@@ -118,7 +122,7 @@ func (r *AuditReport) Evaluate() {
 		if p.Risk == RiskDanger {
 			hasExposedDB = true
 			score -= 30
-			suggestions = append(suggestions, "【高危】高风险服务 "+p.Process+"（端口 "+strconv.Itoa(p.Port)+"）直接暴露于公网，请立即关闭公网监听或用 secctl deny")
+			suggestions = append(suggestions, "【高危】高风险服务 "+p.Process+"（端口 "+strconv.Itoa(p.Port)+"）在非回环地址监听，请核对防火墙和外部可达性")
 		} else if p.Risk == RiskWarn && p.Port == 22 {
 			hasDefaultSSH = true
 			score -= 10
@@ -126,12 +130,16 @@ func (r *AuditReport) Evaluate() {
 		}
 	}
 
-	if !r.FirewallActive {
+	if r.FirewallError != "" {
+		suggestions = append(suggestions, "防火墙状态无法确认："+r.FirewallError)
+	} else if !r.FirewallActive {
 		score -= 25
 		suggestions = append(suggestions, "【警告】服务器系统防火墙未启用！建议启用 UFW 或 iptables 防火墙")
 	}
 
-	if r.DockerInstalled && !r.DockerShieldEnabled {
+	if r.DockerInstalled && r.DockerShieldError != "" {
+		suggestions = append(suggestions, "Docker 防护状态无法确认："+r.DockerShieldError)
+	} else if r.DockerInstalled && !r.DockerShieldEnabled {
 		score -= 20
 		suggestions = append(suggestions, "【警告】检测到 Docker 运行中但未开启 Docker Shield，容器端口可能会绕过防火墙暴露！运行 `secctl docker-shield enable` 修复")
 	}

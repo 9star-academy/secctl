@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,7 +44,7 @@ type HardenResult struct {
 // FetchGitHubKeys downloads public SSH keys for a GitHub user.
 func FetchGitHubKeys(ctx context.Context, username string) ([]string, error) {
 	username = strings.TrimSpace(username)
-	if username == "" {
+	if username == "" || strings.ContainsAny(username, "/?#@\\ \t\r\n") {
 		return nil, fmt.Errorf("GitHub 用户名不能为空")
 	}
 
@@ -63,7 +66,7 @@ func FetchGitHubKeys(ctx context.Context, username string) ([]string, error) {
 		return nil, fmt.Errorf("拉取 GitHub 公钥失败 (HTTP %d): 账号可能不存在", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +88,9 @@ func FetchGitHubKeys(ctx context.Context, username string) ([]string, error) {
 		return nil, fmt.Errorf("GitHub 用户 %s 未公开任何有效 SSH 公钥", username)
 	}
 
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
 	return validKeys, nil
 }
 
@@ -93,8 +99,71 @@ func isValidSSHKey(line string) bool {
 	if len(fields) < 2 {
 		return false
 	}
-	t := fields[0]
-	return strings.HasPrefix(t, "ssh-") || strings.HasPrefix(t, "ecdsa-") || strings.HasPrefix(t, "sk-")
+	switch fields[0] {
+	case "ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com":
+	default:
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		return false
+	}
+	take := func() ([]byte, bool) {
+		if len(raw) < 4 {
+			return nil, false
+		}
+		n := uint64(binary.BigEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if n > uint64(len(raw)) {
+			return nil, false
+		}
+		value := raw[:int(n)]
+		raw = raw[int(n):]
+		return value, true
+	}
+	kind, ok := take()
+	if !ok || string(kind) != fields[0] {
+		return false
+	}
+	value, ok := take()
+	if !ok {
+		return false
+	}
+	switch fields[0] {
+	case "ssh-ed25519":
+		if len(value) != 32 {
+			return false
+		}
+	case "sk-ssh-ed25519@openssh.com":
+		if len(value) != 32 {
+			return false
+		}
+		if _, ok = take(); !ok {
+			return false
+		}
+	case "ssh-rsa":
+		if len(value) == 0 {
+			return false
+		}
+		modulus, ok := take()
+		if !ok || len(modulus) == 0 {
+			return false
+		}
+	default:
+		if string(value) != "nistp256" && string(value) != "nistp384" && string(value) != "nistp521" {
+			return false
+		}
+		point, ok := take()
+		if !ok || len(point) == 0 || point[0] != 4 {
+			return false
+		}
+		if strings.HasPrefix(fields[0], "sk-") {
+			if _, ok = take(); !ok {
+				return false
+			}
+		}
+	}
+	return len(raw) == 0
 }
 
 // InstallAuthorizedKeys appends keys into user's ~/.ssh/authorized_keys
@@ -103,201 +172,186 @@ func InstallAuthorizedKeys(targetUsername string, keys []string) (int, error) {
 		return 0, nil
 	}
 
-	homeDir := ""
+	var account *user.User
+	var err error
 	if targetUsername == "" || targetUsername == "current" {
-		homeDir = os.Getenv("HOME")
+		account, err = user.Current()
 	} else {
-		u, err := user.Lookup(targetUsername)
-		if err != nil {
-			return 0, fmt.Errorf("未找到系统用户 %s: %w", targetUsername, err)
-		}
-		homeDir = u.HomeDir
+		account, err = user.Lookup(targetUsername)
 	}
+	if err != nil {
+		return 0, err
+	}
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return 0, err
+	}
+	gid, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		return 0, err
+	}
+	return installAuthorizedKeys(account.HomeDir, uid, gid, keys)
+}
 
+func installAuthorizedKeys(homeDir string, uid, gid int, keys []string) (int, error) {
 	if homeDir == "" {
-		return 0, fmt.Errorf("无法获取用户的 Home 目录")
+		return 0, fmt.Errorf("无法获取用户 Home 目录")
 	}
-
-	sshDir := filepath.Join(homeDir, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		return 0, fmt.Errorf("创建 %s 失败: %w", sshDir, err)
-	}
-
-	akFile := filepath.Join(sshDir, "authorized_keys")
-	existingMap := make(map[string]bool)
-
-	if data, err := os.ReadFile(akFile); err == nil {
-		scanner := bufio.NewScanner(bytes.NewReader(data))
-		for scanner.Scan() {
-			l := strings.TrimSpace(scanner.Text())
-			if l != "" && !strings.HasPrefix(l, "#") {
-				// Normalize key by taking key-type and base64 part
-				f := strings.Fields(l)
-				if len(f) >= 2 {
-					existingMap[f[0]+" "+f[1]] = true
-				}
-			}
+	for _, key := range keys {
+		if !isValidSSHKey(key) || strings.ContainsAny(key, "\r\n") {
+			return 0, fmt.Errorf("无效 SSH 公钥")
 		}
 	}
-
-	var toAppend []string
+	root, err := os.OpenRoot(homeDir)
+	if err != nil {
+		return 0, err
+	}
+	defer root.Close()
+	if err := root.Mkdir(".ssh", 0700); err != nil && !os.IsExist(err) {
+		return 0, err
+	}
+	for _, name := range []string{".ssh", ".ssh/authorized_keys"} {
+		if info, err := root.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return 0, fmt.Errorf("拒绝写入符号链接: %s", name)
+		} else if err != nil && !os.IsNotExist(err) {
+			return 0, err
+		}
+	}
+	// Root confines every open to the account's home, including racing path changes.
+	directory, err := root.Open(".ssh")
+	if err != nil {
+		return 0, err
+	}
+	defer directory.Close()
+	if err := directory.Chown(uid, gid); err != nil {
+		return 0, err
+	}
+	if err := directory.Chmod(0700); err != nil {
+		return 0, err
+	}
+	f, err := root.OpenFile(".ssh/authorized_keys", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	if err := f.Chown(uid, gid); err != nil {
+		return 0, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		return 0, err
+	}
+	existing, err := io.ReadAll(f)
+	if err != nil {
+		return 0, err
+	}
+	known := map[string]bool{}
+	for _, line := range strings.Split(string(existing), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			known[fields[0]+" "+fields[1]] = true
+		}
+	}
 	added := 0
-	for _, k := range keys {
-		f := strings.Fields(k)
-		if len(f) >= 2 {
-			norm := f[0] + " " + f[1]
-			if !existingMap[norm] {
-				toAppend = append(toAppend, k)
-				existingMap[norm] = true
-				added++
-			}
+	for _, key := range keys {
+		fields := strings.Fields(key)
+		normalized := fields[0] + " " + fields[1]
+		if known[normalized] {
+			continue
 		}
+		if _, err := fmt.Fprintf(f, "\n# Added by secctl\n%s\n", key); err != nil {
+			return added, err
+		}
+		known[normalized] = true
+		added++
 	}
-
-	if len(toAppend) > 0 {
-		f, err := os.OpenFile(akFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-		if err != nil {
-			return 0, fmt.Errorf("写入 %s 失败: %w", akFile, err)
-		}
-		defer f.Close()
-
-		for _, k := range toAppend {
-			if _, err := fmt.Fprintf(f, "\n# Added by secctl on %s\n%s\n", time.Now().Format("2006-01-02 15:04:05"), k); err != nil {
-				return 0, err
-			}
-		}
-	}
-
-	// Ensure 0600 permissions
-	_ = os.Chmod(akFile, 0600)
-	_ = os.Chmod(sshDir, 0700)
-
-	return added, nil
+	return added, f.Sync()
 }
 
-// UpdateSSHDConfig modifies sshd_config in memory and returns new content and changes.
+const managedBegin = "# secctl ssh begin"
+const managedEnd = "# secctl ssh end"
+
 func UpdateSSHDConfig(original string, opts HardenOptions) (string, error) {
-	lines := strings.Split(original, "\n")
-	newLines := make([]string, 0, len(lines)+10)
-
-	foundPort := false
-	foundPasswordAuth := false
-	foundKbdInteractive := false
-	foundPubkeyAuth := false
-	foundPermitRoot := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		fields := strings.Fields(trimmed)
-
-		// Check commented or active directives
-		if len(fields) >= 1 {
-			directive := strings.TrimPrefix(fields[0], "#")
-			directive = strings.ToLower(directive)
-
-			if directive == "port" && opts.Port > 0 {
-				if !foundPort {
-					newLines = append(newLines, fmt.Sprintf("Port %d", opts.Port))
-					foundPort = true
-				}
-				continue
-			}
-
-			if directive == "passwordauthentication" && opts.DisablePassword {
-				if !foundPasswordAuth {
-					newLines = append(newLines, "PasswordAuthentication no")
-					foundPasswordAuth = true
-				}
-				continue
-			}
-
-			if (directive == "kbdinteractiveauthentication" || directive == "challengeresponseauthentication") && opts.DisablePassword {
-				if !foundKbdInteractive {
-					newLines = append(newLines, "KbdInteractiveAuthentication no")
-					foundKbdInteractive = true
-				}
-				continue
-			}
-
-			if directive == "pubkeyauthentication" {
-				if !foundPubkeyAuth {
-					newLines = append(newLines, "PubkeyAuthentication yes")
-					foundPubkeyAuth = true
-				}
-				continue
-			}
-
-			if directive == "permitrootlogin" {
-				if opts.DisableRootLogin {
-					if !foundPermitRoot {
-						newLines = append(newLines, "PermitRootLogin no")
-						foundPermitRoot = true
-					}
-					continue
-				} else if opts.PermitRootKeysOnly {
-					if !foundPermitRoot {
-						newLines = append(newLines, "PermitRootLogin prohibit-password")
-						foundPermitRoot = true
-					}
-					continue
-				}
-			}
+	if opts.Port < 0 || opts.Port > 65535 {
+		return "", fmt.Errorf("SSH 端口必须在 1-65535 之间")
+	}
+	// Do not silently rewrite conditional authentication policies.
+	for _, line := range strings.Split(original, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.EqualFold(fields[0], "Match") {
+			return "", fmt.Errorf("配置包含 Match 条件块，请先手动核对；未修改配置")
 		}
-
-		newLines = append(newLines, line)
 	}
-
-	// If directives were never present, append them at the end
-	if opts.Port > 0 && !foundPort {
-		newLines = append(newLines, fmt.Sprintf("Port %d", opts.Port))
+	var directives []string
+	if opts.Port > 0 {
+		directives = append(directives, fmt.Sprintf("Port %d", opts.Port))
 	}
-	if opts.DisablePassword && !foundPasswordAuth {
-		newLines = append(newLines, "PasswordAuthentication no")
+	if opts.DisablePassword {
+		directives = append(directives, "PasswordAuthentication no", "KbdInteractiveAuthentication no")
 	}
-	if opts.DisablePassword && !foundKbdInteractive {
-		newLines = append(newLines, "KbdInteractiveAuthentication no")
+	directives = append(directives, "PubkeyAuthentication yes")
+	if opts.DisableRootLogin {
+		directives = append(directives, "PermitRootLogin no")
+	} else if opts.PermitRootKeysOnly {
+		directives = append(directives, "PermitRootLogin prohibit-password")
 	}
-	if !foundPubkeyAuth {
-		newLines = append(newLines, "PubkeyAuthentication yes")
+	changed := map[string]bool{"pubkeyauthentication": true}
+	if opts.Port > 0 {
+		changed["port"] = true
 	}
-	if opts.DisableRootLogin && !foundPermitRoot {
-		newLines = append(newLines, "PermitRootLogin no")
-	} else if opts.PermitRootKeysOnly && !foundPermitRoot {
-		newLines = append(newLines, "PermitRootLogin prohibit-password")
+	if opts.DisablePassword {
+		changed["passwordauthentication"] = true
+		changed["kbdinteractiveauthentication"] = true
+		changed["challengeresponseauthentication"] = true
 	}
-
-	return strings.Join(newLines, "\n"), nil
+	if opts.DisableRootLogin || opts.PermitRootKeysOnly {
+		changed["permitrootlogin"] = true
+	}
+	var kept []string
+	// Remove only marker comments; retain prior managed directives that this run does not change.
+	for _, line := range strings.Split(original, "\n") {
+		if strings.TrimSpace(line) == managedBegin || strings.TrimSpace(line) == managedEnd {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 0 && changed[strings.ToLower(fields[0])] {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return managedBegin + "\n" + strings.Join(directives, "\n") + "\n" + managedEnd + "\n" + strings.Join(kept, "\n"), nil
 }
 
-// ReloadSSHD triggers ssh daemon reload safely.
+var CommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+// ReloadSSHD never claims success without a successful service command.
 func ReloadSSHD(ctx context.Context) error {
-	// Try systemctl first
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var failures []error
 	if _, err := exec.LookPath("systemctl"); err == nil {
-		// Ubuntu/Debian uses 'ssh', CentOS/RHEL uses 'sshd'
 		for _, name := range []string{"ssh", "sshd"} {
-			cmd := exec.CommandContext(ctx, "systemctl", "reload", name)
-			if err := cmd.Run(); err == nil {
+			if out, err := CommandRunner(ctx, "systemctl", "reload", name); err == nil {
 				return nil
-			}
-		}
-		// Fallback to restart if reload is unsupported
-		for _, name := range []string{"ssh", "sshd"} {
-			cmd := exec.CommandContext(ctx, "systemctl", "restart", name)
-			if err := cmd.Run(); err == nil {
-				return nil
+			} else {
+				failures = append(failures, fmt.Errorf("reload %s: %s (%w)", name, out, err))
 			}
 		}
 	}
-
-	// Try service command
 	if _, err := exec.LookPath("service"); err == nil {
 		for _, name := range []string{"ssh", "sshd"} {
-			cmd := exec.CommandContext(ctx, "service", name, "reload")
-			if err := cmd.Run(); err == nil {
+			if out, err := CommandRunner(ctx, "service", name, "reload"); err == nil {
 				return nil
+			} else {
+				failures = append(failures, fmt.Errorf("reload %s: %s (%w)", name, out, err))
 			}
 		}
 	}
-
-	return nil
+	if len(failures) == 0 {
+		return fmt.Errorf("未找到 SSH 服务管理工具")
+	}
+	return errors.Join(failures...)
 }

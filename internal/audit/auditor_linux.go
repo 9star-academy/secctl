@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"github.com/9star-academy/secctl/internal/dockershield"
+	"github.com/9star-academy/secctl/internal/firewall"
 	"net"
 	"os"
 	"os/exec"
@@ -24,9 +26,16 @@ func NewAuditor() *SystemAuditor {
 
 func (a *SystemAuditor) Audit(ctx context.Context) (*AuditReport, error) {
 	ports := a.scanPorts(ctx)
-	fwActive, fwType := a.detectFirewall(ctx)
-	sshSummary := a.inspectSSH()
-	dockerInstalled, shieldEnabled := a.detectDocker(ctx)
+	fw := firewall.DetectFirewall()
+	_, fwActive, fwErr := fw.Status(ctx)
+	fwType := fw.Name()
+	sshSummary := a.inspectSSH(ctx)
+	_, dockerErr := exec.LookPath("docker")
+	dockerInstalled := dockerErr == nil
+	shieldEnabled, shieldErr := false, error(nil)
+	if dockerInstalled {
+		shieldEnabled, shieldErr = dockershield.NewShieldManager().IsEnabled(ctx)
+	}
 
 	report := &AuditReport{
 		Ports:               ports,
@@ -38,6 +47,12 @@ func (a *SystemAuditor) Audit(ctx context.Context) (*AuditReport, error) {
 		Score:               100,
 	}
 
+	if fwErr != nil {
+		report.FirewallError = fwErr.Error()
+	}
+	if shieldErr != nil {
+		report.DockerShieldError = shieldErr.Error()
+	}
 	report.Evaluate()
 	return report, nil
 }
@@ -156,6 +171,8 @@ func (a *SystemAuditor) scanPortsProc() []PortItem {
 	var items []PortItem
 	tcpItems := parseProcNet("/proc/net/tcp", "tcp")
 	tcp6Items := parseProcNet("/proc/net/tcp6", "tcp6")
+	items = append(items, parseProcNet("/proc/net/udp", "udp")...)
+	items = append(items, parseProcNet("/proc/net/udp6", "udp6")...)
 	items = append(items, tcpItems...)
 	items = append(items, tcp6Items...)
 	return items
@@ -229,88 +246,43 @@ func parseHexAddr(hexAddr string) (string, int, error) {
 		return ip, port, nil
 	}
 
-	return parts[0], port, nil
+	if len(ipBytes) == 16 {
+		for start := 0; start < 16; start += 4 {
+			ipBytes[start], ipBytes[start+3] = ipBytes[start+3], ipBytes[start]
+			ipBytes[start+1], ipBytes[start+2] = ipBytes[start+2], ipBytes[start+1]
+		}
+		return net.IP(ipBytes).String(), port, nil
+	}
+	return "", 0, fmt.Errorf("invalid IP length")
 }
 
 func isPublicAddr(addr string) bool {
-	if addr == "*" || addr == "0.0.0.0" || addr == "::" || addr == "" {
-		return true
+	addr = strings.Trim(addr, "[]")
+	if i := strings.Index(addr, "%"); i >= 0 {
+		addr = addr[:i]
 	}
-	if addr == "127.0.0.1" || addr == "localhost" || addr == "::1" || strings.HasPrefix(addr, "127.") {
-		return false
-	}
-	return true
+	ip := net.ParseIP(addr)
+	return addr != "localhost" && (ip == nil || !ip.IsLoopback())
 }
 
-func (a *SystemAuditor) detectFirewall(ctx context.Context) (bool, string) {
-	// 1. Check UFW
-	if _, err := exec.LookPath("ufw"); err == nil {
-		cmd := exec.CommandContext(ctx, "ufw", "status")
-		out, err := cmd.Output()
-		if err == nil && strings.Contains(string(out), "Status: active") {
-			return true, "ufw"
-		}
-		if err == nil {
-			return false, "ufw (inactive)"
-		}
-	}
-
-	// 2. Check iptables
-	if _, err := exec.LookPath("iptables"); err == nil {
-		cmd := exec.CommandContext(ctx, "iptables", "-L", "-n")
-		out, err := cmd.Output()
-		if err == nil && len(out) > 0 {
-			// Check if there are non-default rules
-			if strings.Contains(string(out), "REJECT") || strings.Contains(string(out), "DROP") {
-				return true, "iptables"
-			}
-		}
-	}
-
-	return false, "none"
-}
-
-func (a *SystemAuditor) inspectSSH() SSHSummary {
-	summary := SSHSummary{
-		Port:         22,
-		PasswordAuth: "yes", // default in openssh
-		PermitRoot:   "prohibit-password",
-	}
-
-	configPaths := []string{"/etc/ssh/sshd_config", "/etc/sshd_config"}
-	for _, p := range configPaths {
-		file, err := os.Open(p)
-		if err != nil {
-			continue
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if strings.HasPrefix(line, "#") || line == "" {
-				continue
-			}
+func (a *SystemAuditor) inspectSSH(ctx context.Context) SSHSummary {
+	summary := SSHSummary{PasswordAuth: "unknown", PermitRoot: "unknown"}
+	out, err := exec.CommandContext(ctx, "sshd", "-T").Output()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) < 2 {
 				continue
 			}
-
-			key := strings.ToLower(parts[0])
-			val := strings.ToLower(parts[1])
-
-			switch key {
+			switch parts[0] {
 			case "port":
-				if pt, err := strconv.Atoi(val); err == nil {
-					summary.Port = pt
-				}
+				summary.Port, _ = strconv.Atoi(parts[1])
 			case "passwordauthentication":
-				summary.PasswordAuth = val
+				summary.PasswordAuth = parts[1]
 			case "permitrootlogin":
-				summary.PermitRoot = val
+				summary.PermitRoot = parts[1]
 			}
 		}
-		break
 	}
 
 	// Count authorized_keys
@@ -333,26 +305,6 @@ func (a *SystemAuditor) inspectSSH() SSHSummary {
 	return summary
 }
 
-func (a *SystemAuditor) detectDocker(ctx context.Context) (bool, bool) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		return false, false
-	}
-
-	// Check if docker shield rule exists in after.rules or iptables
-	data, err := os.ReadFile("/etc/ufw/after.rules")
-	if err == nil && strings.Contains(string(data), "DOCKER-USER") {
-		return true, true
-	}
-
-	cmd := exec.CommandContext(ctx, "iptables", "-L", "DOCKER-USER", "-n")
-	out, err := cmd.Output()
-	if err == nil && strings.Contains(string(out), "secctl") {
-		return true, true
-	}
-
-	return true, false
-}
-
 func (r *AuditReport) Evaluate() {
 	var suggestions []string
 	score := 100
@@ -360,7 +312,7 @@ func (r *AuditReport) Evaluate() {
 	for _, p := range r.Ports {
 		if p.Risk == RiskDanger {
 			score -= 30
-			suggestions = append(suggestions, fmt.Sprintf("【高危】高风险服务 %s（端口 %d）直接暴露于公网！极易遭到字典爆破与勒索，建议关闭公网暴露", p.Process, p.Port))
+			suggestions = append(suggestions, fmt.Sprintf("【高危】高风险服务 %s（端口 %d）在非回环地址监听；请核对系统防火墙、云安全组与外部可达性", p.Process, p.Port))
 		} else if p.Risk == RiskWarn && p.Port == 22 {
 			score -= 10
 			suggestions = append(suggestions, "【建议】SSH 仍在使用默认 22 端口，常年承受全球全网扫描，建议使用 `secctl ssh harden` 换用非标端口")
@@ -372,12 +324,16 @@ func (r *AuditReport) Evaluate() {
 		suggestions = append(suggestions, "【警告】SSH 仍开启密码登录，建议配置 SSH 密钥后使用 `secctl ssh harden --disable-password` 禁用密码登录")
 	}
 
-	if !r.FirewallActive {
+	if r.FirewallError != "" {
+		suggestions = append(suggestions, "防火墙状态无法确认："+r.FirewallError)
+	} else if !r.FirewallActive {
 		score -= 25
-		suggestions = append(suggestions, "【警告】服务器系统防火墙未启用！所有暴露端口完全裸奔，建议立即配置防火墙")
+		suggestions = append(suggestions, "【警告】服务器系统防火墙未启用！当前防护状态需要核对，请检查系统防火墙及云安全组")
 	}
 
-	if r.DockerInstalled && !r.DockerShieldEnabled {
+	if r.DockerInstalled && r.DockerShieldError != "" {
+		suggestions = append(suggestions, "Docker 防护状态无法确认："+r.DockerShieldError)
+	} else if r.DockerInstalled && !r.DockerShieldEnabled {
 		score -= 20
 		suggestions = append(suggestions, "【警告】检测到 Docker 正在运行，但未开启 Docker Shield 防穿透！容器端口可能会直接绕过 UFW 暴露公网")
 	}
