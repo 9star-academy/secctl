@@ -91,7 +91,7 @@ wait "$SSH_PID" 2>/dev/null || true
 SSH_PID=""
 RESTORED=0
 for _ in $(seq 1 50); do
-  if cmp -s /etc/ssh/sshd_config "$TEST_DIR/sshd_config.original"; then RESTORED=1; break; fi
+  if cmp -s /etc/ssh/sshd_config "$TEST_DIR/sshd_config.original" && [ ! -e /etc/ssh/sshd_config.secctl.pending/pending ]; then RESTORED=1; break; fi
   sleep 0.5
 done
 if [ "$RESTORED" -ne 1 ]; then cat "$TEST_DIR/ssh.log"; echo "FAIL: 挂断后未自动恢复 SSH 配置"; exit 1; fi

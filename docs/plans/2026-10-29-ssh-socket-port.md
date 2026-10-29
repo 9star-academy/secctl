@@ -45,4 +45,5 @@ The user explicitly requested fixing this compatibility issue and publishing a n
 - Local race/coverage suite and vet passed; aggregate coverage 82.0%.
 - Linux/macOS amd64/arm64 builds and installer SHA256 tests passed.
 - The first real-service runs exposed transient recovery service collection during confirmation and active/configured socket listener representation differences. Both have reproducing regression tests and fixes.
-- Ubuntu 22.04 service and Ubuntu 26.04 socket integration passed on source commit `1e3b098`; the subsequent Docker lifecycle CI is being diagnosed before tagging.
+- Ubuntu 22.04 service and Ubuntu 26.04 socket integration passed on source commit `1e3b098`.
+- Real UFW/Docker lifecycle passed on source commit `4ff6688` after fixing missing ufw-user-forward initialization. The combined test now waits for the recovery marker as well as restored file contents, so it cannot check the listener halfway through recovery.
